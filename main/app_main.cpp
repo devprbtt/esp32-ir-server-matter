@@ -372,6 +372,90 @@ int16_t active_target_setpoint(const HvacState &state)
     }
 }
 
+uint8_t normalize_system_mode_for_power(uint8_t requested_mode, bool power)
+{
+    using chip::app::Clusters::Thermostat::SystemModeEnum;
+
+    if (!power) {
+        return static_cast<uint8_t>(SystemModeEnum::kOff);
+    }
+
+    if (requested_mode == static_cast<uint8_t>(SystemModeEnum::kOff)) {
+        return static_cast<uint8_t>(SystemModeEnum::kCool);
+    }
+
+    return requested_mode;
+}
+
+uint8_t thermostat_running_mode_for_state(const HvacState &state)
+{
+    using chip::app::Clusters::Thermostat::SystemModeEnum;
+    using chip::app::Clusters::Thermostat::ThermostatRunningModeEnum;
+
+    if (!state.power || state.system_mode == static_cast<uint8_t>(SystemModeEnum::kOff)) {
+        return static_cast<uint8_t>(ThermostatRunningModeEnum::kOff);
+    }
+
+    if (state.system_mode == static_cast<uint8_t>(SystemModeEnum::kHeat) ||
+        state.system_mode == static_cast<uint8_t>(SystemModeEnum::kEmergencyHeat)) {
+        return static_cast<uint8_t>(ThermostatRunningModeEnum::kHeat);
+    }
+
+    return static_cast<uint8_t>(ThermostatRunningModeEnum::kCool);
+}
+
+uint16_t thermostat_running_state_for_state(const HvacState &state)
+{
+    using chip::app::Clusters::Thermostat::RelayStateBitmap;
+    using chip::app::Clusters::Thermostat::SystemModeEnum;
+
+    if (!state.power || state.system_mode == static_cast<uint8_t>(SystemModeEnum::kOff)) {
+        return 0;
+    }
+
+    if (state.system_mode == static_cast<uint8_t>(SystemModeEnum::kHeat) ||
+        state.system_mode == static_cast<uint8_t>(SystemModeEnum::kEmergencyHeat)) {
+        return static_cast<uint16_t>(RelayStateBitmap::kHeat) | static_cast<uint16_t>(RelayStateBitmap::kFan);
+    }
+
+    return static_cast<uint16_t>(RelayStateBitmap::kCool) | static_cast<uint16_t>(RelayStateBitmap::kFan);
+}
+
+void sync_linked_matter_state(uint16_t endpoint_id, const HvacState &state, bool report_on_off, bool report_system_mode)
+{
+    if (endpoint_id == 0) {
+        return;
+    }
+
+    if (report_on_off) {
+        esp_matter_attr_val_t onoff = esp_matter_bool(state.power);
+        esp_matter::attribute::report(endpoint_id, chip::app::Clusters::OnOff::Id,
+                                      chip::app::Clusters::OnOff::Attributes::OnOff::Id, &onoff);
+    }
+
+    if (report_system_mode) {
+        esp_matter_attr_val_t mode = esp_matter_enum8(state.system_mode);
+        esp_matter::attribute::report(endpoint_id, chip::app::Clusters::Thermostat::Id,
+                                      chip::app::Clusters::Thermostat::Attributes::SystemMode::Id, &mode);
+    }
+
+    if (esp_matter::attribute::get(endpoint_id, chip::app::Clusters::Thermostat::Id,
+                                   chip::app::Clusters::Thermostat::Attributes::ThermostatRunningMode::Id)) {
+        esp_matter_attr_val_t running_mode = esp_matter_enum8(thermostat_running_mode_for_state(state));
+        esp_matter::attribute::report(endpoint_id, chip::app::Clusters::Thermostat::Id,
+                                      chip::app::Clusters::Thermostat::Attributes::ThermostatRunningMode::Id,
+                                      &running_mode);
+    }
+
+    if (esp_matter::attribute::get(endpoint_id, chip::app::Clusters::Thermostat::Id,
+                                   chip::app::Clusters::Thermostat::Attributes::ThermostatRunningState::Id)) {
+        esp_matter_attr_val_t running_state = esp_matter_bitmap16(thermostat_running_state_for_state(state));
+        esp_matter::attribute::report(endpoint_id, chip::app::Clusters::Thermostat::Id,
+                                      chip::app::Clusters::Thermostat::Attributes::ThermostatRunningState::Id,
+                                      &running_state);
+    }
+}
+
 esp_err_t dispatch_hvac_ir(uint8_t index, const char *reason)
 {
     if (index >= g_config.hvac_count) {
@@ -689,9 +773,12 @@ static esp_err_t app_attribute_update_cb(esp_matter::attribute::callback_type_t 
     if (cluster_id == chip::app::Clusters::OnOff::Id &&
         attribute_id == chip::app::Clusters::OnOff::Attributes::OnOff::Id) {
         next.power = val->val.b;
+        next.system_mode = normalize_system_mode_for_power(next.system_mode, next.power);
     } else if (cluster_id == chip::app::Clusters::Thermostat::Id &&
                attribute_id == chip::app::Clusters::Thermostat::Attributes::SystemMode::Id) {
         next.system_mode = static_cast<uint8_t>(val->val.u8);
+        next.power = next.system_mode != static_cast<uint8_t>(chip::app::Clusters::Thermostat::SystemModeEnum::kOff);
+        next.system_mode = normalize_system_mode_for_power(next.system_mode, next.power);
     } else if (cluster_id == chip::app::Clusters::Thermostat::Id &&
                attribute_id == chip::app::Clusters::Thermostat::Attributes::OccupiedCoolingSetpoint::Id) {
         next.cooling_setpoint = val->val.i16;
@@ -706,6 +793,11 @@ static esp_err_t app_attribute_update_cb(esp_matter::attribute::callback_type_t 
     }
 
     g_states[index] = next;
+    sync_linked_matter_state(endpoint_id, next,
+                             cluster_id == chip::app::Clusters::Thermostat::Id &&
+                                 attribute_id == chip::app::Clusters::Thermostat::Attributes::SystemMode::Id,
+                             cluster_id == chip::app::Clusters::OnOff::Id &&
+                                 attribute_id == chip::app::Clusters::OnOff::Attributes::OnOff::Id);
     return dispatch_hvac_ir(static_cast<uint8_t>(index), "matter");
 }
 

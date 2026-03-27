@@ -1,10 +1,14 @@
 import os
 import subprocess
+import sys
 
 Import("env")
 
 
-os.environ.setdefault("IDF_COMPONENT_CACHE_PATH", r"C:\icm")
+if sys.platform.startswith("win"):
+    os.environ.setdefault("IDF_COMPONENT_CACHE_PATH", r"C:\icm")
+else:
+    os.environ.setdefault("IDF_COMPONENT_CACHE_PATH", os.path.expanduser("~/.cache/idf_component_manager"))
 
 
 def _generate_insights_cert_stub():
@@ -21,7 +25,8 @@ def _generate_insights_cert_stub():
         return
 
     os.makedirs(build_dir, exist_ok=True)
-    cmake = os.path.join(env.PioPlatform().get_package_dir("tool-cmake"), "bin", "cmake.exe")
+    cmake_name = "cmake.exe" if sys.platform.startswith("win") else "cmake"
+    cmake = os.path.join(env.PioPlatform().get_package_dir("tool-cmake"), "bin", cmake_name)
     script = os.path.join(
         env.PioPlatform().get_package_dir("framework-espidf"), "tools", "cmake", "scripts", "data_file_embed_asm.cmake"
     )
