@@ -43,9 +43,12 @@ static constexpr uint16_t kCommissioningTimeoutSec = 300;
 static constexpr int kDefaultEmitterGpio = 4;
 static constexpr int kDefaultTempSensorGpio = 16;
 static constexpr uint32_t kTempSensorPollMs = 5000;
+static constexpr int16_t kMinSetpointCentiC = 1600;
+static constexpr int16_t kMaxSetpointCentiC = 3000;
 static constexpr uint8_t kProtocolModeDaikin = 0;
 static constexpr uint8_t kProtocolModeGree = 1;
 static constexpr uint8_t kProtocolModeMidea = 2;
+static constexpr uint8_t kProtocolModeLg = 3;
 
 struct TempSensorConfig {
     char id[16];
@@ -109,6 +112,11 @@ const ModeSelectOption kProtocolModeOptions[] = {
         .mode = kProtocolModeMidea,
         .semanticTags = chip::app::DataModel::List<const ModeSelectSemanticTag>(kEmptyModeSelectSemanticTags, 0),
     },
+    {
+        .label = chip::CharSpan::fromCharString("LG"),
+        .mode = kProtocolModeLg,
+        .semanticTags = chip::app::DataModel::List<const ModeSelectSemanticTag>(kEmptyModeSelectSemanticTags, 0),
+    },
 };
 
 class ProtocolModeManager : public chip::app::Clusters::ModeSelect::SupportedModesManager
@@ -137,6 +145,8 @@ public:
 ProtocolModeManager g_protocol_mode_manager;
 
 int16_t active_target_setpoint(const HvacState &state);
+uint8_t normalized_fan_mode(uint8_t requested_mode, bool power);
+uint8_t reported_fan_mode_for_state(const HvacState &state);
 
 void log_onboarding_codes()
 {
@@ -213,11 +223,11 @@ uint8_t clamp_u8(uint8_t value, uint8_t min_value, uint8_t max_value)
 
 int16_t clamp_setpoint(int value)
 {
-    if (value < 1000) {
-        return 1000;
+    if (value < kMinSetpointCentiC) {
+        return kMinSetpointCentiC;
     }
-    if (value > 3200) {
-        return 3200;
+    if (value > kMaxSetpointCentiC) {
+        return kMaxSetpointCentiC;
     }
     return static_cast<int16_t>(((value + 50) / 100) * 100);
 }
@@ -271,6 +281,36 @@ void report_all_local_temperatures()
     }
 }
 
+void apply_thermostat_limits(uint16_t endpoint_id)
+{
+    auto update_limit = [endpoint_id](uint32_t attribute_id, int16_t value) {
+        esp_matter_attr_val_t attr = esp_matter_int16(value);
+        esp_err_t err = esp_matter::attribute::update(endpoint_id, chip::app::Clusters::Thermostat::Id, attribute_id, &attr);
+        if (err != ESP_OK) {
+            ESP_LOGW(kTag, "Failed to update thermostat limit attr=0x%08lx on endpoint %u: %s",
+                     static_cast<unsigned long>(attribute_id), endpoint_id, esp_err_to_name(err));
+        }
+    };
+
+    update_limit(chip::app::Clusters::Thermostat::Attributes::AbsMinHeatSetpointLimit::Id, kMinSetpointCentiC);
+    update_limit(chip::app::Clusters::Thermostat::Attributes::AbsMaxHeatSetpointLimit::Id, kMaxSetpointCentiC);
+    update_limit(chip::app::Clusters::Thermostat::Attributes::AbsMinCoolSetpointLimit::Id, kMinSetpointCentiC);
+    update_limit(chip::app::Clusters::Thermostat::Attributes::AbsMaxCoolSetpointLimit::Id, kMaxSetpointCentiC);
+    update_limit(chip::app::Clusters::Thermostat::Attributes::MinHeatSetpointLimit::Id, kMinSetpointCentiC);
+    update_limit(chip::app::Clusters::Thermostat::Attributes::MaxHeatSetpointLimit::Id, kMaxSetpointCentiC);
+    update_limit(chip::app::Clusters::Thermostat::Attributes::MinCoolSetpointLimit::Id, kMinSetpointCentiC);
+    update_limit(chip::app::Clusters::Thermostat::Attributes::MaxCoolSetpointLimit::Id, kMaxSetpointCentiC);
+}
+
+void apply_all_thermostat_limits()
+{
+    for (uint8_t i = 0; i < g_config.hvac_count; ++i) {
+        if (g_endpoint_ids[i] != 0) {
+            apply_thermostat_limits(g_endpoint_ids[i]);
+        }
+    }
+}
+
 uint8_t protocol_to_mode(const char *protocol)
 {
     if (!protocol) {
@@ -278,6 +318,9 @@ uint8_t protocol_to_mode(const char *protocol)
     }
     if (strcmp(protocol, "gree") == 0) {
         return kProtocolModeGree;
+    }
+    if (strcmp(protocol, "lg") == 0) {
+        return kProtocolModeLg;
     }
     if (strcmp(protocol, "midea") == 0) {
         return kProtocolModeMidea;
@@ -290,6 +333,8 @@ const char *mode_to_protocol(uint8_t mode)
     switch (mode) {
     case kProtocolModeGree:
         return "gree";
+    case kProtocolModeLg:
+        return "lg";
     case kProtocolModeMidea:
         return "midea";
     case kProtocolModeDaikin:
@@ -529,6 +574,34 @@ uint8_t normalize_system_mode_for_power(uint8_t requested_mode, bool power)
     return requested_mode;
 }
 
+uint8_t normalized_fan_mode(uint8_t requested_mode, bool power)
+{
+    using chip::app::Clusters::FanControl::FanModeEnum;
+
+    switch (requested_mode) {
+    case static_cast<uint8_t>(FanModeEnum::kOn):
+        return static_cast<uint8_t>(FanModeEnum::kHigh);
+    case static_cast<uint8_t>(FanModeEnum::kSmart):
+        return static_cast<uint8_t>(FanModeEnum::kAuto);
+    case static_cast<uint8_t>(FanModeEnum::kOff):
+        return power ? static_cast<uint8_t>(FanModeEnum::kAuto) : static_cast<uint8_t>(FanModeEnum::kOff);
+    default:
+        return requested_mode;
+    }
+}
+
+uint8_t reported_fan_mode_for_state(const HvacState &state)
+{
+    using chip::app::Clusters::FanControl::FanModeEnum;
+    using chip::app::Clusters::Thermostat::SystemModeEnum;
+
+    if (!state.power || state.system_mode == static_cast<uint8_t>(SystemModeEnum::kOff)) {
+        return static_cast<uint8_t>(FanModeEnum::kOff);
+    }
+
+    return normalized_fan_mode(state.fan_mode, true);
+}
+
 uint8_t thermostat_running_mode_for_state(const HvacState &state)
 {
     using chip::app::Clusters::Thermostat::SystemModeEnum;
@@ -596,6 +669,13 @@ void sync_linked_matter_state(uint16_t endpoint_id, const HvacState &state, bool
                                       chip::app::Clusters::Thermostat::Attributes::ThermostatRunningState::Id,
                                       &running_state);
     }
+
+    if (esp_matter::attribute::get(endpoint_id, chip::app::Clusters::FanControl::Id,
+                                   chip::app::Clusters::FanControl::Attributes::FanMode::Id)) {
+        esp_matter_attr_val_t fan_mode = esp_matter_enum8(reported_fan_mode_for_state(state));
+        esp_matter::attribute::report(endpoint_id, chip::app::Clusters::FanControl::Id,
+                                      chip::app::Clusters::FanControl::Attributes::FanMode::Id, &fan_mode);
+    }
 }
 
 esp_err_t dispatch_hvac_ir(uint8_t index, const char *reason)
@@ -650,6 +730,7 @@ esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddItemToArray(protocols, cJSON_CreateString(mode_to_protocol(kProtocolModeDaikin)));
     cJSON_AddItemToArray(protocols, cJSON_CreateString(mode_to_protocol(kProtocolModeGree)));
     cJSON_AddItemToArray(protocols, cJSON_CreateString(mode_to_protocol(kProtocolModeMidea)));
+    cJSON_AddItemToArray(protocols, cJSON_CreateString(mode_to_protocol(kProtocolModeLg)));
 
     cJSON *hvacs = cJSON_AddArrayToObject(root, "hvacs");
     for (uint8_t i = 0; i < g_config.hvac_count; ++i) {
@@ -918,11 +999,13 @@ static esp_err_t app_attribute_update_cb(esp_matter::attribute::callback_type_t 
         attribute_id == chip::app::Clusters::OnOff::Attributes::OnOff::Id) {
         next.power = val->val.b;
         next.system_mode = normalize_system_mode_for_power(next.system_mode, next.power);
+        next.fan_mode = normalized_fan_mode(next.fan_mode, next.power);
     } else if (cluster_id == chip::app::Clusters::Thermostat::Id &&
                attribute_id == chip::app::Clusters::Thermostat::Attributes::SystemMode::Id) {
         next.system_mode = static_cast<uint8_t>(val->val.u8);
         next.power = next.system_mode != static_cast<uint8_t>(chip::app::Clusters::Thermostat::SystemModeEnum::kOff);
         next.system_mode = normalize_system_mode_for_power(next.system_mode, next.power);
+        next.fan_mode = normalized_fan_mode(next.fan_mode, next.power);
     } else if (cluster_id == chip::app::Clusters::Thermostat::Id &&
                attribute_id == chip::app::Clusters::Thermostat::Attributes::OccupiedCoolingSetpoint::Id) {
         next.cooling_setpoint = clamp_setpoint(val->val.i16);
@@ -933,7 +1016,8 @@ static esp_err_t app_attribute_update_cb(esp_matter::attribute::callback_type_t 
         val->val.i16 = next.heating_setpoint;
     } else if (cluster_id == chip::app::Clusters::FanControl::Id &&
                attribute_id == chip::app::Clusters::FanControl::Attributes::FanMode::Id) {
-        next.fan_mode = static_cast<uint8_t>(val->val.u8);
+        next.fan_mode = normalized_fan_mode(static_cast<uint8_t>(val->val.u8), next.power);
+        val->val.u8 = next.fan_mode;
     } else if (cluster_id == chip::app::Clusters::ModeSelect::Id &&
                attribute_id == chip::app::Clusters::ModeSelect::Attributes::CurrentMode::Id) {
         copy_string(g_config.hvacs[index].protocol, sizeof(g_config.hvacs[index].protocol), mode_to_protocol(val->val.u8));
@@ -1063,6 +1147,20 @@ void create_hvac_endpoints(esp_matter::node_t *node)
             continue;
         }
 
+        esp_matter::cluster::fan_control::config_t fan_control_config = {};
+        fan_control_config.fan_mode = reported_fan_mode_for_state(g_states[i]);
+        fan_control_config.fan_mode_sequence =
+            static_cast<uint8_t>(chip::app::Clusters::FanControl::FanModeSequenceEnum::kOffLowMedHighAuto);
+        fan_control_config.percent_setting = nullable<uint8_t>();
+        fan_control_config.percent_current = 0;
+        esp_matter::cluster_t *fan_cluster =
+            esp_matter::cluster::fan_control::create(endpoint, &fan_control_config, esp_matter::CLUSTER_FLAG_SERVER);
+        if (!fan_cluster) {
+            ESP_LOGW(kTag, "Failed to create Fan Control cluster for endpoint %u", esp_matter::endpoint::get_id(endpoint));
+        } else {
+            esp_matter::cluster::fan_control::feature::fan_auto::add(fan_cluster);
+        }
+
         esp_matter::cluster::mode_select::config_t mode_select_config = {};
         copy_string(mode_select_config.mode_select_description, sizeof(mode_select_config.mode_select_description), "Protocol");
         mode_select_config.current_mode = protocol_to_mode(g_config.hvacs[i].protocol);
@@ -1101,6 +1199,7 @@ extern "C" void app_main()
     err = esp_matter::start(app_event_cb);
     ESP_ERROR_CHECK(err);
 
+    apply_all_thermostat_limits();
     init_temperature_sensor();
 
     log_onboarding_codes();

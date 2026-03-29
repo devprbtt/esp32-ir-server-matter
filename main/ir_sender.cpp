@@ -19,6 +19,7 @@ static constexpr size_t kDaikinStateLength = 35;
 static constexpr size_t kDaikinSymbolCount = 292;
 static constexpr size_t kGreeStateLength = 8;
 static constexpr size_t kGreeSymbolCount = 70;
+static constexpr size_t kLgSymbolCount = 32;
 static constexpr size_t kMideaSymbolCount = 100;
 
 static constexpr uint16_t kDaikinHdrMark = 3650;
@@ -33,6 +34,13 @@ static constexpr uint16_t kGreeBitMark = 620;
 static constexpr uint16_t kGreeOneSpace = 1600;
 static constexpr uint16_t kGreeZeroSpace = 540;
 static constexpr uint16_t kGreeMsgSpace = 19980;
+static constexpr uint16_t kLgHdrMark = 8500;
+static constexpr uint16_t kLgHdrSpace = 4250;
+static constexpr uint16_t kLgBitMark = 550;
+static constexpr uint16_t kLgOneSpace = 1600;
+static constexpr uint16_t kLgZeroSpace = 550;
+static constexpr uint16_t kLgRptSpace = 2250;
+static constexpr uint16_t kLgMinGap = 39750;
 static constexpr uint16_t kMideaBitMark = 560;
 static constexpr uint16_t kMideaOneSpace = 1680;
 static constexpr uint16_t kMideaZeroSpace = 560;
@@ -67,6 +75,21 @@ static constexpr uint8_t kMideaACFanAuto = 0;
 static constexpr uint8_t kMideaACFanLow = 1;
 static constexpr uint8_t kMideaACFanMed = 2;
 static constexpr uint8_t kMideaACFanHigh = 3;
+static constexpr uint8_t kLgAcFanLow = 1;
+static constexpr uint8_t kLgAcFanMedium = 2;
+static constexpr uint8_t kLgAcFanMax = 4;
+static constexpr uint8_t kLgAcFanAuto = 5;
+static constexpr uint8_t kLgAcTempAdjust = 15;
+static constexpr uint8_t kLgAcMinTemp = 16;
+static constexpr uint8_t kLgAcMaxTemp = 30;
+static constexpr uint8_t kLgAcCool = 0;
+static constexpr uint8_t kLgAcDry = 1;
+static constexpr uint8_t kLgAcFan = 2;
+static constexpr uint8_t kLgAcAuto = 3;
+static constexpr uint8_t kLgAcHeat = 4;
+static constexpr uint8_t kLgAcPowerOn = 0;
+static constexpr uint8_t kLgAcSignature = 0x88;
+static constexpr uint32_t kLgAcOffCommand = 0x88C0051;
 
 struct EmitterRuntime {
     int gpio = -1;
@@ -278,6 +301,58 @@ uint8_t matter_fan_to_midea(uint8_t fan_mode)
     }
 }
 
+uint8_t matter_mode_to_lg(uint8_t system_mode)
+{
+    switch (system_mode) {
+    case 0:
+    case 1:
+        return kLgAcAuto;
+    case 3:
+    case 6:
+        return kLgAcCool;
+    case 4:
+    case 5:
+        return kLgAcHeat;
+    case 7:
+        return kLgAcFan;
+    case 8:
+    case 9:
+        return kLgAcDry;
+    default:
+        return kLgAcAuto;
+    }
+}
+
+uint8_t matter_fan_to_lg(uint8_t fan_mode)
+{
+    switch (fan_mode) {
+    case 1:
+        return kLgAcFanLow;
+    case 2:
+        return kLgAcFanMedium;
+    case 3:
+    case 4:
+        return kLgAcFanMax;
+    case 5:
+    case 6:
+        return kLgAcFanAuto;
+    default:
+        return kLgAcFanAuto;
+    }
+}
+
+uint8_t centi_c_to_lg_temp(int16_t centi_c)
+{
+    int temp_c = centi_c / 100;
+    if (temp_c < kLgAcMinTemp) {
+        temp_c = kLgAcMinTemp;
+    }
+    if (temp_c > kLgAcMaxTemp) {
+        temp_c = kLgAcMaxTemp;
+    }
+    return static_cast<uint8_t>(temp_c);
+}
+
 void fill_daikin_state(const hvac_ir_command_t *command, uint8_t state[kDaikinStateLength])
 {
     static const uint8_t kBaseState[kDaikinStateLength] = {
@@ -339,6 +414,40 @@ void fill_gree_state(const hvac_ir_command_t *command, uint8_t state[kGreeStateL
     state[5] = 0x20;
     state[6] = 0x00;
     state[7] = static_cast<uint8_t>(calc_kelvinator_style_checksum(state, kGreeStateLength) << 4);
+}
+
+uint8_t sum_nibbles_u32(uint32_t value, uint8_t count)
+{
+    uint8_t total = 0;
+    for (uint8_t i = 0; i < count; ++i) {
+        total = static_cast<uint8_t>(total + ((value >> (i * 4)) & 0x0FU));
+    }
+    return total;
+}
+
+uint8_t calc_lg_checksum(uint32_t state_without_checksum)
+{
+    return static_cast<uint8_t>(sum_nibbles_u32(state_without_checksum >> 4, 6) & 0x0F);
+}
+
+uint32_t build_lg_command(const hvac_ir_command_t *command)
+{
+    if (!command->power) {
+        return kLgAcOffCommand;
+    }
+
+    const uint8_t mode = matter_mode_to_lg(command->system_mode);
+    const uint8_t fan = matter_fan_to_lg(command->fan_mode);
+    const uint8_t temp_c = centi_c_to_lg_temp(command->target_temperature_centi_c);
+
+    uint32_t state = 0;
+    state |= static_cast<uint32_t>(fan & 0x0F) << 4;
+    state |= static_cast<uint32_t>((temp_c - kLgAcTempAdjust) & 0x0F) << 8;
+    state |= static_cast<uint32_t>(mode & 0x07) << 12;
+    state |= static_cast<uint32_t>(kLgAcPowerOn & 0x03) << 18;
+    state |= static_cast<uint32_t>(kLgAcSignature) << 20;
+    state |= calc_lg_checksum(state);
+    return state;
 }
 
 uint8_t reverse_bits8(uint8_t value)
@@ -419,6 +528,15 @@ void append_bits_msb_first(rmt_symbol_word_t *symbols, size_t *offset, size_t ca
     }
 }
 
+void append_uint_bits_msb_first(rmt_symbol_word_t *symbols, size_t *offset, size_t capacity, uint32_t value, uint8_t bit_count,
+                                uint16_t mark_us, uint16_t one_space_us, uint16_t zero_space_us)
+{
+    for (int bit = bit_count - 1; bit >= 0; --bit) {
+        const bool one = ((value >> bit) & 0x1U) != 0;
+        append_symbol(symbols, offset, capacity, mark_us, one ? one_space_us : zero_space_us);
+    }
+}
+
 size_t build_daikin_symbols(const uint8_t state[kDaikinStateLength], rmt_symbol_word_t *symbols, size_t capacity)
 {
     size_t offset = 0;
@@ -457,6 +575,21 @@ size_t build_gree_symbols(const uint8_t state[kGreeStateLength], rmt_symbol_word
 
     append_bits_lsb_first(symbols, &offset, capacity, state + 4, 4);
     append_symbol(symbols, &offset, capacity, kGreeBitMark, kGreeMsgSpace);
+
+    return offset;
+}
+
+size_t build_lg_symbols(uint32_t state, rmt_symbol_word_t *symbols, size_t capacity)
+{
+    size_t offset = 0;
+
+    append_symbol(symbols, &offset, capacity, kLgHdrMark, kLgHdrSpace);
+    append_uint_bits_msb_first(symbols, &offset, capacity, state, 28, kLgBitMark, kLgOneSpace, kLgZeroSpace);
+    append_symbol(symbols, &offset, capacity, kLgBitMark, kLgMinGap);
+
+    // LG 28-bit messages include a repeat-specific frame after each command.
+    append_symbol(symbols, &offset, capacity, kLgHdrMark, kLgRptSpace);
+    append_symbol(symbols, &offset, capacity, kLgBitMark, kLgMinGap);
 
     return offset;
 }
@@ -606,6 +739,30 @@ esp_err_t send_gree(const hvac_ir_command_t *command)
     return ESP_OK;
 }
 
+esp_err_t send_lg(const hvac_ir_command_t *command)
+{
+    EmitterRuntime *emitter = get_or_create_emitter(command->emitter_gpio);
+    ESP_RETURN_ON_FALSE(emitter, ESP_ERR_NOT_FOUND, kTag, "emitter unavailable");
+
+    const uint32_t state = build_lg_command(command);
+    rmt_symbol_word_t symbols[kLgSymbolCount] = {};
+    const size_t symbol_count = build_lg_symbols(state, symbols, kLgSymbolCount);
+
+    rmt_transmit_config_t transmit_config = {
+        .loop_count = 0,
+        .flags = {
+            .eot_level = 0,
+            .queue_nonblocking = false,
+        },
+    };
+
+    ESP_RETURN_ON_ERROR(rmt_transmit(emitter->channel, emitter->encoder, symbols, symbol_count * sizeof(rmt_symbol_word_t),
+                                     &transmit_config),
+                        kTag, "rmt_transmit failed");
+    ESP_RETURN_ON_ERROR(rmt_tx_wait_all_done(emitter->channel, -1), kTag, "rmt_tx_wait_all_done failed");
+    return ESP_OK;
+}
+
 esp_err_t send_midea(const hvac_ir_command_t *command)
 {
     EmitterRuntime *emitter = get_or_create_emitter(command->emitter_gpio);
@@ -635,7 +792,8 @@ esp_err_t send_midea(const hvac_ir_command_t *command)
 
 bool ir_sender_is_protocol_supported(const char *protocol)
 {
-    return protocol_equals(protocol, "daikin") || protocol_equals(protocol, "gree") || protocol_equals(protocol, "midea");
+    return protocol_equals(protocol, "daikin") || protocol_equals(protocol, "gree") || protocol_equals(protocol, "lg") ||
+           protocol_equals(protocol, "midea");
 }
 
 esp_err_t ir_sender_send(const hvac_ir_command_t *command)
@@ -658,6 +816,8 @@ esp_err_t ir_sender_send(const hvac_ir_command_t *command)
         err = send_daikin(command);
     } else if (protocol_equals(command->protocol, "gree")) {
         err = send_gree(command);
+    } else if (protocol_equals(command->protocol, "lg")) {
+        err = send_lg(command);
     } else if (protocol_equals(command->protocol, "midea")) {
         err = send_midea(command);
     } else {
