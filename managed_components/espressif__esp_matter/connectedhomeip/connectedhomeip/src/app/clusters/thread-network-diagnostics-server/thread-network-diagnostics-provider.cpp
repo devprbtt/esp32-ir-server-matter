@@ -19,9 +19,7 @@
 
 #include <app-common/zap-generated/cluster-objects.h>
 #include <app/data-model/Encode.h>
-#include <inttypes.h>
 #include <lib/support/CodeUtils.h>
-#include <lib/support/logging/CHIPLogging.h>
 #include <platform/CHIPDeviceLayer.h>
 
 #if (CHIP_DEVICE_CONFIG_ENABLE_THREAD && !CHIP_DEVICE_CONFIG_USES_OTBR_POSIX_DBUS_STACK)
@@ -863,8 +861,7 @@ CHIP_ERROR WriteThreadNetworkDiagnosticAttributeToTlv(AttributeId attributeId, a
         break;
     }
 #else
-    ChipLogProgress(Zcl, "Thread diagnostics fallback (thread disabled): attr=0x%08" PRIx32,
-                    static_cast<uint32_t>(attributeId));
+    ChipLogProgress(Zcl, "Thread diagnostics fallback (thread disabled): attr=0x%08" PRIx32, attributeId);
     switch (attributeId)
     {
     case Attributes::NeighborTable::Id:
@@ -947,11 +944,6 @@ CHIP_ERROR WriteThreadNetworkDiagnosticAttributeToTlv(AttributeId attributeId, a
         break;
     }
 #endif // (CHIP_DEVICE_CONFIG_ENABLE_THREAD && !CHIP_DEVICE_CONFIG_USES_OTBR_POSIX_DBUS_STACK)
-    if (err != CHIP_NO_ERROR)
-    {
-        ChipLogError(Zcl, "Thread diagnostics provider failed: attr=0x%08" PRIx32 " err=%" CHIP_ERROR_FORMAT,
-                     static_cast<uint32_t>(attributeId), err.Format());
-    }
     return err;
 }
 

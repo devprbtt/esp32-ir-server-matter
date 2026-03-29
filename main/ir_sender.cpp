@@ -7,11 +7,12 @@
 #include <driver/rmt_tx.h>
 #include <esp_check.h>
 #include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 namespace {
 
 static const char *kTag = "ir_sender";
-static constexpr uint8_t kMaxEmitters = 4;
 static constexpr uint32_t kResolutionHz = 1000000;
 static constexpr uint32_t kCarrierHz = 38000;
 static constexpr size_t kDaikinStateLength = 35;
@@ -73,7 +74,41 @@ struct EmitterRuntime {
     rmt_encoder_handle_t encoder = nullptr;
 };
 
-EmitterRuntime g_emitters[kMaxEmitters] = {};
+EmitterRuntime g_emitter = {};
+SemaphoreHandle_t g_emitters_mutex = nullptr;
+
+SemaphoreHandle_t get_emitters_mutex()
+{
+    if (!g_emitters_mutex) {
+        g_emitters_mutex = xSemaphoreCreateMutex();
+    }
+    return g_emitters_mutex;
+}
+
+void reset_emitter(EmitterRuntime &slot)
+{
+    if (slot.channel) {
+        esp_err_t err = rmt_disable(slot.channel);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(kTag, "rmt_disable failed during emitter reset: %s", esp_err_to_name(err));
+        }
+    }
+    if (slot.encoder) {
+        esp_err_t err = rmt_del_encoder(slot.encoder);
+        if (err != ESP_OK) {
+            ESP_LOGW(kTag, "rmt_del_encoder failed during emitter reset: %s", esp_err_to_name(err));
+        }
+    }
+    if (slot.channel) {
+        esp_err_t err = rmt_del_channel(slot.channel);
+        if (err != ESP_OK) {
+            ESP_LOGW(kTag, "rmt_del_channel failed during emitter reset: %s", esp_err_to_name(err));
+        }
+    }
+    slot.gpio = -1;
+    slot.channel = nullptr;
+    slot.encoder = nullptr;
+}
 
 bool protocol_equals(const char *lhs, const char *rhs)
 {
@@ -452,70 +487,73 @@ EmitterRuntime *get_or_create_emitter(int gpio)
         return nullptr;
     }
 
-    for (uint8_t i = 0; i < kMaxEmitters; ++i) {
-        if (g_emitters[i].gpio == gpio) {
-            return &g_emitters[i];
+    if (g_emitter.gpio == gpio) {
+        if (!g_emitter.channel || !g_emitter.encoder) {
+            ESP_LOGW(kTag, "Emitter for GPIO %d is incomplete, recreating it", gpio);
+            reset_emitter(g_emitter);
+        } else {
+            return &g_emitter;
         }
     }
 
-    for (uint8_t i = 0; i < kMaxEmitters; ++i) {
-        if (g_emitters[i].gpio >= 0) {
-            continue;
-        }
-
-        EmitterRuntime &slot = g_emitters[i];
-        rmt_tx_channel_config_t channel_config = {
-            .gpio_num = static_cast<gpio_num_t>(gpio),
-            .clk_src = RMT_CLK_SRC_DEFAULT,
-            .resolution_hz = kResolutionHz,
-            .mem_block_symbols = 512,
-            .trans_queue_depth = 4,
-            .flags = {
-                .invert_out = false,
-                .with_dma = false,
-                .io_loop_back = false,
-                .io_od_mode = false,
-            },
-        };
-        esp_err_t err = rmt_new_tx_channel(&channel_config, &slot.channel);
-        if (err != ESP_OK) {
-            ESP_LOGE(kTag, "rmt_new_tx_channel failed: %s", esp_err_to_name(err));
-            return nullptr;
-        }
-
-        rmt_copy_encoder_config_t encoder_config = {};
-        err = rmt_new_copy_encoder(&encoder_config, &slot.encoder);
-        if (err != ESP_OK) {
-            ESP_LOGE(kTag, "rmt_new_copy_encoder failed: %s", esp_err_to_name(err));
-            return nullptr;
-        }
-
-        rmt_carrier_config_t carrier_config = {
-            .frequency_hz = kCarrierHz,
-            .duty_cycle = 0.33f,
-            .flags = {
-                .polarity_active_low = false,
-            },
-        };
-        err = rmt_apply_carrier(slot.channel, &carrier_config);
-        if (err != ESP_OK) {
-            ESP_LOGE(kTag, "rmt_apply_carrier failed: %s", esp_err_to_name(err));
-            return nullptr;
-        }
-
-        err = rmt_enable(slot.channel);
-        if (err != ESP_OK) {
-            ESP_LOGE(kTag, "rmt_enable failed: %s", esp_err_to_name(err));
-            return nullptr;
-        }
-
-        slot.gpio = gpio;
-        ESP_LOGI(kTag, "Configured IR emitter on GPIO %d", gpio);
-        return &slot;
+    if (g_emitter.gpio >= 0 && g_emitter.gpio != gpio) {
+        ESP_LOGI(kTag, "Reconfiguring IR emitter from GPIO %d to GPIO %d", g_emitter.gpio, gpio);
+        reset_emitter(g_emitter);
     }
 
-    ESP_LOGE(kTag, "No free emitter slots for GPIO %d", gpio);
-    return nullptr;
+    EmitterRuntime &slot = g_emitter;
+    slot.gpio = gpio;
+    rmt_tx_channel_config_t channel_config = {
+        .gpio_num = static_cast<gpio_num_t>(gpio),
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = kResolutionHz,
+        .mem_block_symbols = 512,
+        .trans_queue_depth = 4,
+        .flags = {
+            .invert_out = false,
+            .with_dma = false,
+            .io_loop_back = false,
+            .io_od_mode = false,
+        },
+    };
+    esp_err_t err = rmt_new_tx_channel(&channel_config, &slot.channel);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "rmt_new_tx_channel failed: %s", esp_err_to_name(err));
+        reset_emitter(slot);
+        return nullptr;
+    }
+
+    rmt_copy_encoder_config_t encoder_config = {};
+    err = rmt_new_copy_encoder(&encoder_config, &slot.encoder);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "rmt_new_copy_encoder failed: %s", esp_err_to_name(err));
+        reset_emitter(slot);
+        return nullptr;
+    }
+
+    rmt_carrier_config_t carrier_config = {
+        .frequency_hz = kCarrierHz,
+        .duty_cycle = 0.33f,
+        .flags = {
+            .polarity_active_low = false,
+        },
+    };
+    err = rmt_apply_carrier(slot.channel, &carrier_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "rmt_apply_carrier failed: %s", esp_err_to_name(err));
+        reset_emitter(slot);
+        return nullptr;
+    }
+
+    err = rmt_enable(slot.channel);
+    if (err != ESP_OK) {
+        ESP_LOGE(kTag, "rmt_enable failed: %s", esp_err_to_name(err));
+        reset_emitter(slot);
+        return nullptr;
+    }
+
+    ESP_LOGI(kTag, "Configured IR emitter on GPIO %d", gpio);
+    return &slot;
 }
 
 esp_err_t send_daikin(const hvac_ir_command_t *command)
@@ -605,15 +643,26 @@ esp_err_t ir_sender_send(const hvac_ir_command_t *command)
     if (!command || !command->protocol) {
         return ESP_ERR_INVALID_ARG;
     }
+    SemaphoreHandle_t mutex = get_emitters_mutex();
+    if (!mutex) {
+        ESP_LOGE(kTag, "Failed to create emitter mutex");
+        return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(kTag, "Failed to lock emitter mutex");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = ESP_ERR_NOT_SUPPORTED;
     if (protocol_equals(command->protocol, "daikin")) {
-        return send_daikin(command);
+        err = send_daikin(command);
+    } else if (protocol_equals(command->protocol, "gree")) {
+        err = send_gree(command);
+    } else if (protocol_equals(command->protocol, "midea")) {
+        err = send_midea(command);
+    } else {
+        ESP_LOGW(kTag, "Unsupported protocol: %s", command->protocol);
     }
-    if (protocol_equals(command->protocol, "gree")) {
-        return send_gree(command);
-    }
-    if (protocol_equals(command->protocol, "midea")) {
-        return send_midea(command);
-    }
-    ESP_LOGW(kTag, "Unsupported protocol: %s", command->protocol);
-    return ESP_ERR_NOT_SUPPORTED;
+    xSemaphoreGive(mutex);
+    return err;
 }

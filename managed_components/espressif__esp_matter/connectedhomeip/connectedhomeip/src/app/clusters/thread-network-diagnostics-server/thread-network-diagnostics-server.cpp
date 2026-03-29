@@ -26,12 +26,10 @@
 #include <app/EventLogging.h>
 #include <app/clusters/thread-network-diagnostics-server/thread-network-diagnostics-provider.h>
 #include <app/util/attribute-storage.h>
-#include <inttypes.h>
 #include <lib/core/CHIPEncoding.h>
 #include <lib/core/Optional.h>
 #include <lib/core/TLVTypes.h>
 #include <lib/support/CHIPPlatformMemory.h>
-#include <lib/support/logging/CHIPLogging.h>
 #include <platform/CHIPDeviceLayer.h>
 #include <platform/DiagnosticDataProvider.h>
 #include <tracing/macros.h>
@@ -60,14 +58,13 @@ ThreadDiagnosticsAttrAccess gAttrAccess;
 
 CHIP_ERROR ThreadDiagnosticsAttrAccess::Read(const ConcreteReadAttributePath & aPath, AttributeValueEncoder & aEncoder)
 {
-    ChipLogProgress(Zcl, "Thread diagnostics read: ep=%" PRIu16 " attr=0x%08" PRIx32, aPath.mEndpointId,
-                    static_cast<uint32_t>(aPath.mAttributeId));
-
     if (aPath.mClusterId != ThreadNetworkDiagnostics::Id)
     {
         // We shouldn't have been called at all.
         return CHIP_ERROR_INVALID_ARGUMENT;
     }
+
+    ChipLogProgress(Zcl, "Thread diagnostics read: ep=%u attr=0x%08" PRIx32, aPath.mEndpointId, aPath.mAttributeId);
 
     switch (aPath.mAttributeId)
     {
@@ -135,12 +132,13 @@ CHIP_ERROR ThreadDiagnosticsAttrAccess::Read(const ConcreteReadAttributePath & a
     case ThreadNetworkDiagnostics::Attributes::Delay::Id:
     case ThreadNetworkDiagnostics::Attributes::ChannelPage0Mask::Id:
     case ThreadNetworkDiagnostics::Attributes::ExtAddress::Id:
-    case ThreadNetworkDiagnostics::Attributes::Rloc16::Id: {
+    case ThreadNetworkDiagnostics::Attributes::Rloc16::Id:
+    {
         CHIP_ERROR err = WriteThreadNetworkDiagnosticAttributeToTlv(aPath.mAttributeId, aEncoder);
         if (err != CHIP_NO_ERROR)
         {
-            ChipLogError(Zcl, "Thread diagnostics read failed: attr=0x%08" PRIx32 " err=%" CHIP_ERROR_FORMAT,
-                         static_cast<uint32_t>(aPath.mAttributeId), err.Format());
+            ChipLogError(Zcl, "Thread diagnostics read failed: attr=0x%08" PRIx32 " err=%" CHIP_ERROR_FORMAT, aPath.mAttributeId,
+                         err.Format());
         }
         return err;
     }

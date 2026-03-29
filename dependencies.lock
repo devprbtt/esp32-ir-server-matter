@@ -9,6 +9,17 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 0.6.1~4
+  espressif/ds18b20:
+    component_hash: 87a753636db56dbb42633b8fdd615c63c5e752ec9c9629e6386d8115f36efc30
+    dependencies:
+    - name: espressif/onewire_bus
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.0.0
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.1.2
   espressif/esp-serial-flasher:
     component_hash: dcc42a16712a1a636509cf0bf90e14032d7f2141784b533613b267b6aa318d52
     dependencies: []
@@ -208,6 +219,16 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.11.0
+  espressif/onewire_bus:
+    component_hash: 11729fd9a5de80225177a61e9cd77de91683b8ec300e83710d5327b666dbe884
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.0.4
   espressif/rmaker_common:
     component_hash: c7bcaed645c54c781bb9e75067fc213cf1ce1d0d71f7276621eadd02b89a71e9
     dependencies:
@@ -221,9 +242,10 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.3
+    version: 5.5.0
 direct_dependencies:
+- espressif/ds18b20
 - espressif/esp_matter
-manifest_hash: 7ad26321421b39b5605bd28f35ad8b898d19ca29911a468711caed46daa83b95
+manifest_hash: 21a7ecc1ab60cb11b0b04081b5790ab8de697dc5152d434e2582159b55211a7f
 target: esp32
 version: 2.0.0

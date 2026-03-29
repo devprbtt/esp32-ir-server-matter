@@ -7,18 +7,19 @@ Current scope:
 - Matter room-air-conditioner endpoint baseline
 - Matter Wi-Fi commissioning flow
 - NVS-backed HVAC registration/config
-- Backend protocol selection per HVAC
+- Matter `Mode Select` protocol picker per HVAC
 - Backend temperature-source assignment per HVAC
 - IR transmit support for `daikin`, `gree`, and `midea`
+- DS18B20 temperature input with setpoint fallback when no sensor is detected
 - Simple HTTP API for config and runtime status
 - Thermostat mode and power state kept in sync for Home Assistant climate control
 
 Current limits:
-- No physical DS18B20 integration yet
 - Config changes that alter endpoint count require reboot
 - Matter commissioning currently depends on BLE from the commissioner side
 - Some Matter startup warnings still need cleanup
-- Changing the IR emitter GPIO at runtime can fail if the previous RMT TX channel is still allocated
+- DS18B20 is only probed at boot today, so connecting one after startup requires a reboot
+- Home Assistant may still render decimal setpoint controls even though firmware rounds to whole-degree values before sending IR
 
 Endpoints:
 - `GET /api/config`
@@ -33,11 +34,15 @@ Commissioning:
 
 - Matter commissioning with Home Assistant is working.
 - The ESP32 restores Wi-Fi and fabric state after reboot.
+- Home Assistant creates a protocol dropdown from the Matter `Mode Select` cluster after a clean recommission.
 - Home Assistant climate mode writes now work correctly:
   - `off` maps to `SystemMode=0` and `OnOff=0`
   - `cool` maps to `SystemMode=3` and `OnOff=1`
   - `heat` maps to `SystemMode=4` and `OnOff=1`
 - Power toggle feedback is working in Home Assistant.
+- IR sends are working again after releasing the unused DS18B20 1-Wire RMT bus when no sensor is present.
+- DS18B20 polling works when the sensor is present at boot; otherwise local temperature falls back to the active setpoint.
+- Setpoints are rounded to whole degrees before the IR protocol state is built.
 - The previous `ThreadNetworkDiagnostics` read failures from Home Assistant were fixed by returning fallback values on Wi-Fi-only builds instead of `CHIP_ERROR_NOT_IMPLEMENTED`.
 
 ## Build Notes
@@ -71,6 +76,7 @@ Available endpoints:
 - the supported protocol list
 - current endpoint IDs
 - active runtime state such as power, mode, setpoints, and last send error
+- `temp_sensor_gpio` and whether a DS18B20 is currently detected
 
 Current supported IR protocols:
 
@@ -88,6 +94,11 @@ The built-in default HVAC entry is:
 - `emitter_gpio`: `4`
 - `temp_sensor_index`: `0`
 - `current_temp_source`: `sensor`
+
+Default GPIO choices used by the firmware:
+
+- IR emitter GPIO: `4`
+- DS18B20 GPIO: `16`
 
 ## How To Change Protocol And IR GPIO
 
@@ -152,43 +163,41 @@ Example successful response shape:
 {"ok":true,"id":"hvac-1","protocol":"daikin","emitter_gpio":4,"error":"ESP_OK","active_target_c":23}
 ```
 
-## Known IR GPIO Issue
+## Temperature Sensor Behavior
 
-Changing the saved config from one emitter GPIO to another currently exposes an RMT allocation issue.
+The DS18B20 path uses a 1-Wire bus on GPIO `16`.
 
-Observed behavior after switching from `daikin` on GPIO `4` to `gree` on GPIO `27`:
+Current behavior:
 
-- `GET /api/config` correctly reports `protocol:"gree"` and `emitter_gpio:27`
-- `GET /api/status` correctly reports the new values
-- `POST /api/hvac/send` fails with `ESP_ERR_NOT_FOUND`
+- If a DS18B20 is detected during boot, the firmware keeps the 1-Wire bus active and reports `LocalTemperature` from the sensor.
+- If no DS18B20 is detected during boot, the firmware releases the 1-Wire bus so IR can use RMT and falls back to the active setpoint as `LocalTemperature`.
+- If you connect a DS18B20 after boot, reboot the device so it gets detected and the polling task starts.
 
-Relevant runtime logs:
+Typical no-sensor boot log:
 
 ```text
-rmt: no free tx channels
-ir_sender: rmt_new_tx_channel failed: ESP_ERR_NOT_FOUND
-ir_sender: send_gree(...) emitter unavailable
+No DS18B20 detected on GPIO 16
+Released 1-Wire bus on GPIO 16 because no DS18B20 is active
 ```
 
-This means:
+## Setpoint Rounding
 
-- protocol selection is working
-- config persistence is working
-- the send path is failing because the firmware tries to allocate a fresh RMT TX channel for the new GPIO and does not recover cleanly when channels are already consumed
+The firmware rounds setpoints to whole degrees before updating runtime state and sending IR commands.
 
-## Next Change To Make GPIO Switching Work
+Examples:
 
-The next code change should be in `main/ir_sender.cpp`.
+- `26.5` requested from a controller is sent as `27`
+- `21.0` stays `21`
 
-Goal:
+Home Assistant may still show decimal controls in its UI, but the firmware normalizes values before IR transmit.
 
-- allow runtime emitter GPIO changes without exhausting RMT TX channels
+## IR Runtime Notes
 
-Recommended implementation:
+IR sending now uses a single owned emitter runtime in `main/ir_sender.cpp`, and successful live logs look like:
 
-1. Add an emitter release path that disables and deletes the old `rmt_channel_handle_t` and `rmt_encoder_handle_t`.
-2. Detect when a saved/configured GPIO has changed for an HVAC and release the old emitter before creating a new one.
-3. If only one emitter is needed, prefer reusing a single slot/channel instead of allocating a new one per GPIO forever.
-4. Keep logging the selected `protocol` and `emitter_gpio` on every send for easy verification.
+```text
+ir_sender: Configured IR emitter on GPIO 4
+hvac_matter: send ... protocol=gree emitter_gpio=4 ... err=ESP_OK
+```
 
-Until that change lands, changing `protocol` and `emitter_gpio` together is persisted correctly but may not transmit successfully after switching to a new GPIO.
+Changing `protocol` or `emitter_gpio` through `/api/config` is persisted correctly. Reboot after changes so the runtime starts from a clean state.

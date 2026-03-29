@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
 #include <esp_check.h>
 #include <esp_err.h>
 #include <esp_http_server.h>
@@ -17,10 +20,13 @@
 #include <app-common/zap-generated/ids/Clusters.h>
 #include <app/server/CommissioningWindowManager.h>
 #include <app/server/Server.h>
+#include <app/clusters/mode-select-server/supported-modes-manager.h>
 #include <setup_payload/OnboardingCodesUtil.h>
 #include <setup_payload/QRCodeSetupPayloadGenerator.h>
 
 #include <cJSON.h>
+#include <ds18b20.h>
+#include <onewire_bus.h>
 
 #include "ir_sender.h"
 
@@ -35,6 +41,11 @@ static constexpr uint8_t kMaxSensors = 4;
 static constexpr size_t kMaxBodyBytes = 4096;
 static constexpr uint16_t kCommissioningTimeoutSec = 300;
 static constexpr int kDefaultEmitterGpio = 4;
+static constexpr int kDefaultTempSensorGpio = 16;
+static constexpr uint32_t kTempSensorPollMs = 5000;
+static constexpr uint8_t kProtocolModeDaikin = 0;
+static constexpr uint8_t kProtocolModeGree = 1;
+static constexpr uint8_t kProtocolModeMidea = 2;
 
 struct TempSensorConfig {
     char id[16];
@@ -71,6 +82,61 @@ AppConfig g_config = {};
 HvacState g_states[kMaxHvacs] = {};
 uint16_t g_endpoint_ids[kMaxHvacs] = {};
 httpd_handle_t g_httpd = nullptr;
+onewire_bus_handle_t g_onewire_bus = nullptr;
+ds18b20_device_handle_t g_ds18b20 = nullptr;
+TaskHandle_t g_temp_sensor_task = nullptr;
+bool g_temp_sensor_detected = false;
+float g_last_sensor_temp_c = 0.0f;
+
+using ModeSelectOption = chip::app::Clusters::ModeSelect::Structs::ModeOptionStruct::Type;
+using ModeSelectSemanticTag = chip::app::Clusters::ModeSelect::Structs::SemanticTagStruct::Type;
+using ModeSelectStatus = chip::Protocols::InteractionModel::Status;
+
+const ModeSelectSemanticTag kEmptyModeSelectSemanticTags[1] = {};
+const ModeSelectOption kProtocolModeOptions[] = {
+    {
+        .label = chip::CharSpan::fromCharString("Daikin"),
+        .mode = kProtocolModeDaikin,
+        .semanticTags = chip::app::DataModel::List<const ModeSelectSemanticTag>(kEmptyModeSelectSemanticTags, 0),
+    },
+    {
+        .label = chip::CharSpan::fromCharString("Gree"),
+        .mode = kProtocolModeGree,
+        .semanticTags = chip::app::DataModel::List<const ModeSelectSemanticTag>(kEmptyModeSelectSemanticTags, 0),
+    },
+    {
+        .label = chip::CharSpan::fromCharString("Midea"),
+        .mode = kProtocolModeMidea,
+        .semanticTags = chip::app::DataModel::List<const ModeSelectSemanticTag>(kEmptyModeSelectSemanticTags, 0),
+    },
+};
+
+class ProtocolModeManager : public chip::app::Clusters::ModeSelect::SupportedModesManager
+{
+public:
+    ModeOptionsProvider getModeOptionsProvider(chip::EndpointId) const override
+    {
+        return ModeOptionsProvider(kProtocolModeOptions,
+                                   kProtocolModeOptions + (sizeof(kProtocolModeOptions) / sizeof(kProtocolModeOptions[0])));
+    }
+
+    ModeSelectStatus getModeOptionByMode(chip::EndpointId, uint8_t mode, const ModeSelectOption ** data_ptr) const override
+    {
+        for (const auto & option : kProtocolModeOptions) {
+            if (option.mode == mode) {
+                if (data_ptr) {
+                    *data_ptr = &option;
+                }
+                return ModeSelectStatus::Success;
+            }
+        }
+        return ModeSelectStatus::InvalidCommand;
+    }
+};
+
+ProtocolModeManager g_protocol_mode_manager;
+
+int16_t active_target_setpoint(const HvacState &state);
 
 void log_onboarding_codes()
 {
@@ -153,7 +219,83 @@ int16_t clamp_setpoint(int value)
     if (value > 3200) {
         return 3200;
     }
-    return static_cast<int16_t>(value);
+    return static_cast<int16_t>(((value + 50) / 100) * 100);
+}
+
+int16_t temperature_c_to_centi_c(float temperature_c)
+{
+    return static_cast<int16_t>(temperature_c * 100.0f);
+}
+
+int16_t fallback_local_temperature_for_state(const HvacState &state)
+{
+    return active_target_setpoint(state);
+}
+
+void refresh_local_temperature_from_source(uint8_t index)
+{
+    if (index >= g_config.hvac_count) {
+        return;
+    }
+
+    if (g_temp_sensor_detected) {
+        g_states[index].local_temperature = temperature_c_to_centi_c(g_last_sensor_temp_c);
+        return;
+    }
+
+    g_states[index].local_temperature = fallback_local_temperature_for_state(g_states[index]);
+}
+
+void refresh_all_local_temperatures()
+{
+    for (uint8_t i = 0; i < g_config.hvac_count; ++i) {
+        refresh_local_temperature_from_source(i);
+    }
+}
+
+void report_local_temperature(uint8_t index)
+{
+    if (index >= g_config.hvac_count || g_endpoint_ids[index] == 0) {
+        return;
+    }
+
+    esp_matter_attr_val_t local_temperature = esp_matter_nullable_int16(nullable<int16_t>(g_states[index].local_temperature));
+    esp_matter::attribute::report(g_endpoint_ids[index], chip::app::Clusters::Thermostat::Id,
+                                  chip::app::Clusters::Thermostat::Attributes::LocalTemperature::Id, &local_temperature);
+}
+
+void report_all_local_temperatures()
+{
+    for (uint8_t i = 0; i < g_config.hvac_count; ++i) {
+        report_local_temperature(i);
+    }
+}
+
+uint8_t protocol_to_mode(const char *protocol)
+{
+    if (!protocol) {
+        return kProtocolModeDaikin;
+    }
+    if (strcmp(protocol, "gree") == 0) {
+        return kProtocolModeGree;
+    }
+    if (strcmp(protocol, "midea") == 0) {
+        return kProtocolModeMidea;
+    }
+    return kProtocolModeDaikin;
+}
+
+const char *mode_to_protocol(uint8_t mode)
+{
+    switch (mode) {
+    case kProtocolModeGree:
+        return "gree";
+    case kProtocolModeMidea:
+        return "midea";
+    case kProtocolModeDaikin:
+    default:
+        return "daikin";
+    }
 }
 
 void load_default_config()
@@ -181,7 +323,7 @@ void load_default_states()
         g_states[i].fan_mode = 5;
         g_states[i].cooling_setpoint = 2400;
         g_states[i].heating_setpoint = 2000;
-        g_states[i].local_temperature = 2350;
+        g_states[i].local_temperature = fallback_local_temperature_for_state(g_states[i]);
         g_states[i].last_send_err = ESP_OK;
     }
 }
@@ -505,9 +647,9 @@ esp_err_t status_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "hvac_count", g_config.hvac_count);
 
     cJSON *protocols = cJSON_AddArrayToObject(root, "supported_protocols");
-    cJSON_AddItemToArray(protocols, cJSON_CreateString("daikin"));
-    cJSON_AddItemToArray(protocols, cJSON_CreateString("gree"));
-    cJSON_AddItemToArray(protocols, cJSON_CreateString("midea"));
+    cJSON_AddItemToArray(protocols, cJSON_CreateString(mode_to_protocol(kProtocolModeDaikin)));
+    cJSON_AddItemToArray(protocols, cJSON_CreateString(mode_to_protocol(kProtocolModeGree)));
+    cJSON_AddItemToArray(protocols, cJSON_CreateString(mode_to_protocol(kProtocolModeMidea)));
 
     cJSON *hvacs = cJSON_AddArrayToObject(root, "hvacs");
     for (uint8_t i = 0; i < g_config.hvac_count; ++i) {
@@ -521,11 +663,13 @@ esp_err_t status_get_handler(httpd_req_t *req)
         cJSON_AddBoolToObject(item, "power", g_states[i].power);
         cJSON_AddNumberToObject(item, "system_mode", g_states[i].system_mode);
         cJSON_AddNumberToObject(item, "fan_mode", g_states[i].fan_mode);
-        cJSON_AddNumberToObject(item, "cooling_setpoint_c", g_states[i].cooling_setpoint / 100.0);
-        cJSON_AddNumberToObject(item, "heating_setpoint_c", g_states[i].heating_setpoint / 100.0);
+        cJSON_AddNumberToObject(item, "cooling_setpoint_c", g_states[i].cooling_setpoint / 100);
+        cJSON_AddNumberToObject(item, "heating_setpoint_c", g_states[i].heating_setpoint / 100);
         cJSON_AddNumberToObject(item, "local_temperature_c", g_states[i].local_temperature / 100.0);
         cJSON_AddStringToObject(item, "current_temp_source", g_config.hvacs[i].current_temp_source);
         cJSON_AddNumberToObject(item, "temp_sensor_index", g_config.hvacs[i].temp_sensor_index);
+        cJSON_AddNumberToObject(item, "temp_sensor_gpio", kDefaultTempSensorGpio);
+        cJSON_AddBoolToObject(item, "temp_sensor_detected", g_temp_sensor_detected);
         cJSON_AddStringToObject(item, "last_send_error", esp_err_to_name(g_states[i].last_send_err));
         cJSON_AddItemToArray(hvacs, item);
     }
@@ -668,7 +812,7 @@ esp_err_t hvac_send_post_handler(httpd_req_t *req)
     cJSON_AddStringToObject(resp, "protocol", g_config.hvacs[index].protocol);
     cJSON_AddNumberToObject(resp, "emitter_gpio", g_config.hvacs[index].emitter_gpio);
     cJSON_AddStringToObject(resp, "error", esp_err_to_name(err));
-    cJSON_AddNumberToObject(resp, "active_target_c", active_target_setpoint(g_states[index]) / 100.0);
+    cJSON_AddNumberToObject(resp, "active_target_c", active_target_setpoint(g_states[index]) / 100);
     char *json = cJSON_PrintUnformatted(resp);
     cJSON_Delete(resp);
     esp_err_t send_err = send_json_response(req, json);
@@ -781,24 +925,121 @@ static esp_err_t app_attribute_update_cb(esp_matter::attribute::callback_type_t 
         next.system_mode = normalize_system_mode_for_power(next.system_mode, next.power);
     } else if (cluster_id == chip::app::Clusters::Thermostat::Id &&
                attribute_id == chip::app::Clusters::Thermostat::Attributes::OccupiedCoolingSetpoint::Id) {
-        next.cooling_setpoint = val->val.i16;
+        next.cooling_setpoint = clamp_setpoint(val->val.i16);
+        val->val.i16 = next.cooling_setpoint;
     } else if (cluster_id == chip::app::Clusters::Thermostat::Id &&
                attribute_id == chip::app::Clusters::Thermostat::Attributes::OccupiedHeatingSetpoint::Id) {
-        next.heating_setpoint = val->val.i16;
+        next.heating_setpoint = clamp_setpoint(val->val.i16);
+        val->val.i16 = next.heating_setpoint;
     } else if (cluster_id == chip::app::Clusters::FanControl::Id &&
                attribute_id == chip::app::Clusters::FanControl::Attributes::FanMode::Id) {
         next.fan_mode = static_cast<uint8_t>(val->val.u8);
+    } else if (cluster_id == chip::app::Clusters::ModeSelect::Id &&
+               attribute_id == chip::app::Clusters::ModeSelect::Attributes::CurrentMode::Id) {
+        copy_string(g_config.hvacs[index].protocol, sizeof(g_config.hvacs[index].protocol), mode_to_protocol(val->val.u8));
+        ESP_RETURN_ON_ERROR(save_config(), kTag, "Failed to persist protocol selection for %s", g_config.hvacs[index].id);
+        ESP_LOGI(kTag, "Protocol mode changed for %s endpoint=%u mode=%u protocol=%s", g_config.hvacs[index].id, endpoint_id,
+                 val->val.u8, g_config.hvacs[index].protocol);
     } else {
         return ESP_OK;
     }
 
     g_states[index] = next;
+    refresh_local_temperature_from_source(static_cast<uint8_t>(index));
     sync_linked_matter_state(endpoint_id, next,
                              cluster_id == chip::app::Clusters::Thermostat::Id &&
                                  attribute_id == chip::app::Clusters::Thermostat::Attributes::SystemMode::Id,
                              cluster_id == chip::app::Clusters::OnOff::Id &&
                                  attribute_id == chip::app::Clusters::OnOff::Attributes::OnOff::Id);
+    report_local_temperature(static_cast<uint8_t>(index));
     return dispatch_hvac_ir(static_cast<uint8_t>(index), "matter");
+}
+
+void temperature_sensor_task(void *)
+{
+    while (true) {
+        bool detected = false;
+        float temperature_c = 0.0f;
+
+        if (g_ds18b20) {
+            if (ds18b20_trigger_temperature_conversion(g_ds18b20) == ESP_OK &&
+                ds18b20_get_temperature(g_ds18b20, &temperature_c) == ESP_OK) {
+                detected = true;
+                g_last_sensor_temp_c = temperature_c;
+            }
+        }
+
+        const bool sensor_state_changed = (g_temp_sensor_detected != detected);
+        g_temp_sensor_detected = detected;
+        refresh_all_local_temperatures();
+        report_all_local_temperatures();
+
+        if (g_temp_sensor_detected) {
+            ESP_LOGI(kTag, "DS18B20 temperature=%.2fC gpio=%d", g_last_sensor_temp_c, kDefaultTempSensorGpio);
+        } else if (sensor_state_changed) {
+            ESP_LOGW(kTag, "No DS18B20 detected on GPIO %d, using setpoint fallback for local temperature", kDefaultTempSensorGpio);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(kTempSensorPollMs));
+    }
+}
+
+void init_temperature_sensor()
+{
+    onewire_bus_config_t bus_config = {
+        .bus_gpio_num = kDefaultTempSensorGpio,
+        .flags = {
+            .en_pull_up = true,
+        },
+    };
+    onewire_bus_rmt_config_t rmt_config = {
+        .max_rx_bytes = 10,
+    };
+
+    esp_err_t err = onewire_new_bus_rmt(&bus_config, &rmt_config, &g_onewire_bus);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "Failed to initialize 1-Wire bus on GPIO %d: %s", kDefaultTempSensorGpio, esp_err_to_name(err));
+        return;
+    }
+
+    onewire_device_iter_handle_t iter = nullptr;
+    err = onewire_new_device_iter(g_onewire_bus, &iter);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "Failed to create DS18B20 iterator on GPIO %d: %s", kDefaultTempSensorGpio, esp_err_to_name(err));
+        onewire_bus_del(g_onewire_bus);
+        g_onewire_bus = nullptr;
+        return;
+    }
+
+    onewire_device_t device;
+    err = onewire_device_iter_get_next(iter, &device);
+    if (err == ESP_OK) {
+        ds18b20_config_t ds18b20_config = {};
+        err = ds18b20_new_device(&device, &ds18b20_config, &g_ds18b20);
+        if (err == ESP_OK) {
+            ds18b20_set_resolution(g_ds18b20, DS18B20_RESOLUTION_12B);
+            ESP_LOGI(kTag, "DS18B20 detected on GPIO %d address=%016llX", kDefaultTempSensorGpio, device.address);
+        } else {
+            ESP_LOGW(kTag, "1-Wire device on GPIO %d is not a DS18B20: %s", kDefaultTempSensorGpio, esp_err_to_name(err));
+        }
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(kTag, "No DS18B20 detected on GPIO %d", kDefaultTempSensorGpio);
+    } else {
+        ESP_LOGW(kTag, "DS18B20 search failed on GPIO %d: %s", kDefaultTempSensorGpio, esp_err_to_name(err));
+    }
+
+    if (iter) {
+        onewire_del_device_iter(iter);
+    }
+
+    if (!g_ds18b20) {
+        onewire_bus_del(g_onewire_bus);
+        g_onewire_bus = nullptr;
+        ESP_LOGI(kTag, "Released 1-Wire bus on GPIO %d because no DS18B20 is active", kDefaultTempSensorGpio);
+        return;
+    }
+
+    xTaskCreate(temperature_sensor_task, "temp_sensor", 4096, nullptr, 5, &g_temp_sensor_task);
 }
 
 void create_hvac_endpoints(esp_matter::node_t *node)
@@ -822,6 +1063,14 @@ void create_hvac_endpoints(esp_matter::node_t *node)
             continue;
         }
 
+        esp_matter::cluster::mode_select::config_t mode_select_config = {};
+        copy_string(mode_select_config.mode_select_description, sizeof(mode_select_config.mode_select_description), "Protocol");
+        mode_select_config.current_mode = protocol_to_mode(g_config.hvacs[i].protocol);
+        mode_select_config.delegate = &g_protocol_mode_manager;
+        if (!esp_matter::cluster::mode_select::create(endpoint, &mode_select_config, esp_matter::CLUSTER_FLAG_SERVER)) {
+            ESP_LOGW(kTag, "Failed to create Mode Select cluster for endpoint %u", esp_matter::endpoint::get_id(endpoint));
+        }
+
         g_endpoint_ids[i] = esp_matter::endpoint::get_id(endpoint);
         ESP_LOGI(kTag, "Created HVAC endpoint %u for %s using protocol=%s emitter_gpio=%d", g_endpoint_ids[i],
                  g_config.hvacs[i].id, g_config.hvacs[i].protocol, g_config.hvacs[i].emitter_gpio);
@@ -841,6 +1090,7 @@ extern "C" void app_main()
 
     load_default_states();
     load_config();
+    refresh_all_local_temperatures();
 
     esp_matter::node::config_t node_config;
     esp_matter::node_t *node = esp_matter::node::create(&node_config, app_attribute_update_cb, app_identification_cb);
@@ -851,8 +1101,11 @@ extern "C" void app_main()
     err = esp_matter::start(app_event_cb);
     ESP_ERROR_CHECK(err);
 
+    init_temperature_sensor();
+
     log_onboarding_codes();
 
     start_http_server();
     ESP_LOGI(kTag, "HTTP backend ready at /api/config, /api/status, and /api/hvac/send");
+    ESP_LOGI(kTag, "GPIO selection: ir_emitter=%d temp_sensor=%d", g_config.hvacs[0].emitter_gpio, kDefaultTempSensorGpio);
 }
