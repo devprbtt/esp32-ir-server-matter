@@ -23,6 +23,8 @@
 #include <app/clusters/mode-select-server/supported-modes-manager.h>
 #include <setup_payload/OnboardingCodesUtil.h>
 #include <setup_payload/QRCodeSetupPayloadGenerator.h>
+#include <platform/AttributeList.h>
+#include <platform/DeviceInfoProvider.h>
 
 #include <cJSON.h>
 #include <ds18b20.h>
@@ -118,6 +120,61 @@ const ModeSelectOption kProtocolModeOptions[] = {
         .semanticTags = chip::app::DataModel::List<const ModeSelectSemanticTag>(kEmptyModeSelectSemanticTags, 0),
     },
 };
+
+void format_hvac_display_name(uint8_t hvac_index, char *buffer, size_t size)
+{
+    if (g_config.hvac_count <= 1) {
+        snprintf(buffer, size, "%s", "Air Conditioner");
+        return;
+    }
+
+    snprintf(buffer, size, "Air Conditioner %u", static_cast<unsigned>(hvac_index + 1));
+}
+
+void apply_hvac_user_labels()
+{
+    using chip::DeviceLayer::AttributeList;
+    using chip::DeviceLayer::DeviceInfoProvider;
+    using chip::DeviceLayer::GetDeviceInfoProvider;
+
+    DeviceInfoProvider *provider = GetDeviceInfoProvider();
+    if (!provider) {
+        ESP_LOGW(kTag, "DeviceInfoProvider unavailable; skipping friendly endpoint labels");
+        return;
+    }
+
+    for (uint8_t i = 0; i < g_config.hvac_count; ++i) {
+        if (g_endpoint_ids[i] == 0) {
+            continue;
+        }
+
+        char display_name[32];
+        format_hvac_display_name(i, display_name, sizeof(display_name));
+
+        AttributeList<DeviceInfoProvider::UserLabelType, chip::DeviceLayer::kMaxUserLabelListLength> label_list;
+        DeviceInfoProvider::UserLabelType name_label = {
+            .label = chip::CharSpan::fromCharString("name"),
+            .value = chip::CharSpan::fromCharString(display_name),
+        };
+        DeviceInfoProvider::UserLabelType role_label = {
+            .label = chip::CharSpan::fromCharString("role"),
+            .value = chip::CharSpan::fromCharString("Climate"),
+        };
+        if (label_list.add(name_label) != CHIP_NO_ERROR || label_list.add(role_label) != CHIP_NO_ERROR) {
+            ESP_LOGW(kTag, "Failed to prepare friendly labels for endpoint %u", g_endpoint_ids[i]);
+            continue;
+        }
+
+        CHIP_ERROR err = provider->SetUserLabelList(g_endpoint_ids[i], label_list);
+        if (err != CHIP_NO_ERROR) {
+            ESP_LOGW(kTag, "Failed to apply friendly labels to endpoint %u: %" CHIP_ERROR_FORMAT,
+                     g_endpoint_ids[i], err.Format());
+            continue;
+        }
+
+        ESP_LOGI(kTag, "Applied friendly endpoint labels to endpoint %u (%s)", g_endpoint_ids[i], display_name);
+    }
+}
 
 class ProtocolModeManager : public chip::app::Clusters::ModeSelect::SupportedModesManager
 {
@@ -1161,8 +1218,13 @@ void create_hvac_endpoints(esp_matter::node_t *node)
             esp_matter::cluster::fan_control::feature::fan_auto::add(fan_cluster);
         }
 
+        esp_matter::cluster::user_label::config_t user_label_config = {};
+        if (!esp_matter::cluster::user_label::create(endpoint, &user_label_config, esp_matter::CLUSTER_FLAG_SERVER)) {
+            ESP_LOGW(kTag, "Failed to create User Label cluster for endpoint %u", esp_matter::endpoint::get_id(endpoint));
+        }
+
         esp_matter::cluster::mode_select::config_t mode_select_config = {};
-        copy_string(mode_select_config.mode_select_description, sizeof(mode_select_config.mode_select_description), "Protocol");
+        copy_string(mode_select_config.mode_select_description, sizeof(mode_select_config.mode_select_description), "IR Protocol");
         mode_select_config.current_mode = protocol_to_mode(g_config.hvacs[i].protocol);
         mode_select_config.delegate = &g_protocol_mode_manager;
         if (!esp_matter::cluster::mode_select::create(endpoint, &mode_select_config, esp_matter::CLUSTER_FLAG_SERVER)) {
@@ -1200,6 +1262,7 @@ extern "C" void app_main()
     ESP_ERROR_CHECK(err);
 
     apply_all_thermostat_limits();
+    apply_hvac_user_labels();
     init_temperature_sensor();
 
     log_onboarding_codes();
