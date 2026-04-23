@@ -8,10 +8,14 @@
 
 #include <esp_check.h>
 #include <esp_err.h>
+#include <esp_event.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
 #include <esp_matter.h>
+#include <esp_netif.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
+#include <mdns.h>
 #include <nvs.h>
 #include <nvs_flash.h>
 
@@ -37,6 +41,8 @@ namespace {
 static const char *kTag = "hvac_matter";
 static const char *kNvsNamespace = "hvacmatter";
 static const char *kNvsConfigKey = "config";
+static const char *kWifiHostname = "ir-hvac";
+static const char *kHttpMdnsInstanceName = "IR HVAC Setup";
 
 static constexpr uint8_t kMaxHvacs = 2;
 static constexpr uint8_t kMaxSensors = 4;
@@ -51,6 +57,9 @@ static constexpr uint8_t kProtocolModeDaikin = 0;
 static constexpr uint8_t kProtocolModeGree = 1;
 static constexpr uint8_t kProtocolModeMidea = 2;
 static constexpr uint8_t kProtocolModeLg = 3;
+
+extern const uint8_t kTlsRootCaPemStart[] asm("_binary_tls_root_ca_pem_start");
+extern const uint8_t kTlsRootCaPemEnd[] asm("_binary_tls_root_ca_pem_end");
 
 struct TempSensorConfig {
     char id[16];
@@ -92,6 +101,9 @@ ds18b20_device_handle_t g_ds18b20 = nullptr;
 TaskHandle_t g_temp_sensor_task = nullptr;
 bool g_temp_sensor_detected = false;
 float g_last_sensor_temp_c = 0.0f;
+bool g_wifi_hostname_set = false;
+bool g_mdns_started = false;
+bool g_http_mdns_service_started = false;
 
 using ModeSelectOption = chip::app::Clusters::ModeSelect::Structs::ModeOptionStruct::Type;
 using ModeSelectSemanticTag = chip::app::Clusters::ModeSelect::Structs::SemanticTagStruct::Type;
@@ -204,6 +216,136 @@ ProtocolModeManager g_protocol_mode_manager;
 int16_t active_target_setpoint(const HvacState &state);
 uint8_t normalized_fan_mode(uint8_t requested_mode, bool power);
 uint8_t reported_fan_mode_for_state(const HvacState &state);
+void prepare_wifi_hostname();
+void set_wifi_hostname();
+void ensure_mdns_started();
+void advertise_http_setup_service_if_ready();
+void sync_protocol_mode_to_matter(uint8_t index);
+void advertise_http_setup_service(const esp_ip4_addr_t &ip);
+
+static const char kSetupPageHtml[] = R"html(<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Climate Setup</title>
+<style>
+:root{color-scheme:light;--ink:#111827;--muted:#697282;--line:rgba(17,24,39,.11);--card:rgba(255,255,255,.72);--blue:#007aff;--green:#34c759;--red:#ff3b30;--shadow:0 24px 80px rgba(31,41,55,.18)}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue",sans-serif;color:var(--ink);background:radial-gradient(circle at 18% 12%,#fff 0 16%,transparent 38%),radial-gradient(circle at 84% 10%,#dff3ff 0 14%,transparent 36%),linear-gradient(145deg,#eef5ff 0%,#f7f4ef 46%,#e9f7f1 100%);display:grid;place-items:center;padding:24px}
+body:before{content:"";position:fixed;inset:0;background-image:linear-gradient(rgba(255,255,255,.38) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.3) 1px,transparent 1px);background-size:44px 44px;mask-image:linear-gradient(to bottom,rgba(0,0,0,.45),transparent 72%);pointer-events:none}
+.shell{width:min(940px,100%);position:relative}.hero{display:grid;grid-template-columns:1.05fr .95fr;gap:22px;align-items:stretch}.panel,.preview{background:var(--card);border:1px solid rgba(255,255,255,.72);box-shadow:var(--shadow);backdrop-filter:blur(24px) saturate(1.2);-webkit-backdrop-filter:blur(24px) saturate(1.2);border-radius:34px}
+.panel{padding:30px}.eyebrow{display:inline-flex;align-items:center;gap:8px;margin:0 0 18px;padding:7px 12px;border-radius:999px;background:rgba(255,255,255,.7);border:1px solid var(--line);font-size:13px;color:var(--muted);font-weight:650}.dot{width:8px;height:8px;border-radius:999px;background:var(--green);box-shadow:0 0 0 5px rgba(52,199,89,.13)}
+h1{font-size:clamp(38px,7vw,72px);line-height:.92;letter-spacing:-.065em;margin:0 0 14px}.sub{font-size:18px;line-height:1.45;color:var(--muted);margin:0 0 28px;max-width:560px}.field{display:grid;gap:11px;margin:0 0 20px}.label{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:#8b95a5;font-weight:800}.select-wrap{position:relative}.select-wrap:after{content:"v";position:absolute;right:18px;top:50%;transform:translateY(-58%);font-size:18px;color:#7b8494;pointer-events:none}
+select{appearance:none;width:100%;border:1px solid var(--line);background:rgba(255,255,255,.78);border-radius:22px;padding:18px 48px 18px 18px;font:700 20px/1 -apple-system,BlinkMacSystemFont,"SF Pro Display",sans-serif;color:var(--ink);outline:none;box-shadow:inset 0 1px 0 rgba(255,255,255,.8)}
+.protocols{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:10px 0 22px}.chip{border:1px solid var(--line);background:rgba(255,255,255,.68);border-radius:18px;padding:13px 10px;text-align:center;font-weight:760;color:#3f4652;cursor:pointer;transition:.18s ease}.chip.active{background:#111827;color:#fff;box-shadow:0 12px 30px rgba(17,24,39,.24);transform:translateY(-1px)}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:12px}button{border:0;border-radius:20px;padding:16px 18px;font-weight:800;font-size:16px;cursor:pointer;transition:.18s ease;box-shadow:0 12px 30px rgba(31,41,55,.12)}button:active{transform:scale(.98)}button:disabled{opacity:.55;cursor:not-allowed}.primary{background:var(--blue);color:white}.secondary{background:rgba(255,255,255,.75);color:#141a24;border:1px solid var(--line)}
+.status{min-height:48px;margin-top:18px;padding:14px 16px;border-radius:18px;background:rgba(255,255,255,.58);border:1px solid var(--line);color:var(--muted);line-height:1.35}.status.good{color:#14783c;background:rgba(52,199,89,.12)}.status.bad{color:#b42318;background:rgba(255,59,48,.11)}
+.preview{padding:24px;display:flex;flex-direction:column;justify-content:space-between;min-height:520px;overflow:hidden;position:relative}.preview:before{content:"";position:absolute;inset:auto -80px -140px auto;width:320px;height:320px;border-radius:50%;background:linear-gradient(135deg,#7dd3fc,#60a5fa 45%,#34d399);filter:blur(6px);opacity:.38}.device{position:relative;border-radius:32px;background:linear-gradient(180deg,#fdfdfd,#f2f5f8);border:1px solid rgba(255,255,255,.9);box-shadow:inset 0 1px 0 #fff,0 18px 42px rgba(17,24,39,.14);padding:20px;min-height:330px}.pill{display:inline-flex;gap:7px;align-items:center;border-radius:999px;background:#111827;color:white;padding:9px 12px;font-size:13px;font-weight:750}.temp{font-size:92px;letter-spacing:-.08em;margin:44px 0 0;font-weight:800}.deg{font-size:.38em;vertical-align:super;margin-left:2px}.meta{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:24px}.tile{background:rgba(255,255,255,.76);border:1px solid var(--line);border-radius:20px;padding:14px}.tile b{display:block;font-size:22px;letter-spacing:-.04em}.tile span{display:block;margin-top:4px;color:var(--muted);font-size:13px}.foot{position:relative;margin-top:18px;color:var(--muted);font-size:14px;line-height:1.45}
+@media(max-width:760px){body{padding:14px;place-items:start center}.hero{grid-template-columns:1fr}.panel{padding:22px;border-radius:28px}.preview{min-height:auto;border-radius:28px}.protocols{grid-template-columns:repeat(2,1fr)}.actions{grid-template-columns:1fr}.device{min-height:260px}.temp{font-size:70px;margin-top:30px}}
+</style>
+</head>
+<body>
+<main class="shell">
+<section class="hero">
+<div class="panel">
+<p class="eyebrow"><span class="dot"></span><span id="connectivity">Looking for device</span></p>
+<h1>Set up your air conditioner</h1>
+<p class="sub">Choose the IR protocol for this air conditioner, send a quick test, then save it to the device.</p>
+<div class="field">
+<span class="label">Air conditioner</span>
+<div class="select-wrap"><select id="hvacSelect" aria-label="Air conditioner"></select></div>
+</div>
+<div class="field">
+<span class="label">IR protocol</span>
+<div class="protocols" id="protocols"></div>
+</div>
+<div class="actions">
+<button class="secondary" id="testBtn">Test protocol</button>
+<button class="primary" id="saveBtn">Save protocol</button>
+</div>
+<div class="status" id="status">Loading current configuration...</div>
+</div>
+<aside class="preview">
+<div class="device">
+<span class="pill">IR Climate Bridge</span>
+<div class="temp"><span id="targetTemp">24</span><span class="deg">&deg;</span></div>
+<div class="meta">
+<div class="tile"><b id="currentProtocol">--</b><span>Selected protocol</span></div>
+<div class="tile"><b id="emitterGpio">--</b><span>Emitter GPIO</span></div>
+</div>
+</div>
+<p class="foot">Tip: if the AC beeps or reacts after testing, press Save. If nothing happens, try the next protocol.</p>
+</aside>
+</section>
+</main>
+<script>
+const protocolLabels={daikin:"Daikin",gree:"Gree",midea:"Midea",lg:"LG"};
+const els={connectivity:document.querySelector("#connectivity"),hvacSelect:document.querySelector("#hvacSelect"),protocols:document.querySelector("#protocols"),status:document.querySelector("#status"),testBtn:document.querySelector("#testBtn"),saveBtn:document.querySelector("#saveBtn"),currentProtocol:document.querySelector("#currentProtocol"),emitterGpio:document.querySelector("#emitterGpio"),targetTemp:document.querySelector("#targetTemp")};
+let config=null,statusData=null,selectedId=null,selectedProtocol="daikin",busy=false,userEditing=false,lastStatusText="";
+function setStatus(text,type=""){els.status.textContent=text;els.status.className=`status ${type}`;}
+function currentHvac(){return (config?.hvacs||[]).find(h=>h.id===selectedId)||config?.hvacs?.[0];}
+function statusHvac(){return (statusData?.hvacs||[]).find(h=>h.id===selectedId)||statusData?.hvacs?.[0];}
+function applyRemoteState(cfg,stat,{announce=false}={}){
+ config=cfg;statusData=stat;
+ const hvac=currentHvac()||cfg?.hvacs?.[0];selectedId=selectedId||hvac?.id;
+ const active=currentHvac();if(active&&!userEditing)selectedProtocol=(active.protocol||"daikin").toLowerCase();
+ render();
+ const label=protocolLabels[(active?.protocol||"").toLowerCase()]||active?.protocol;
+ if(announce&&label){lastStatusText=`Current saved protocol is ${label}.`;setStatus(lastStatusText,"good");}
+}
+function render(){
+ const hvacs=config?.hvacs||[];els.hvacSelect.innerHTML=hvacs.map(h=>`<option value="${h.id}">${h.id}</option>`).join("");
+ if(!selectedId&&hvacs[0])selectedId=hvacs[0].id;els.hvacSelect.value=selectedId||"";
+ const supported=statusData?.supported_protocols||["daikin","gree","midea","lg"];
+ els.protocols.innerHTML=supported.map(p=>`<button class="chip ${p===selectedProtocol?"active":""}" data-protocol="${p}" type="button">${protocolLabels[p]||p}</button>`).join("");
+ const hvac=currentHvac(), live=statusHvac();
+ els.currentProtocol.textContent=protocolLabels[selectedProtocol]||selectedProtocol||"--";
+ els.emitterGpio.textContent=hvac?`GPIO ${hvac.emitter_gpio}`:"--";
+ els.targetTemp.textContent=Math.round(live?.cooling_setpoint_c||24);
+ els.testBtn.disabled=!hvac;els.saveBtn.disabled=!hvac||selectedProtocol===hvac.protocol;
+ els.connectivity.textContent=hvac?"Device connected":"No HVAC configured";
+}
+async function load(){
+ try{
+  const [cfg,stat]=await Promise.all([fetch("/api/config",{cache:"no-store"}),fetch("/api/status",{cache:"no-store"})]);
+  applyRemoteState(await cfg.json(),await stat.json(),{announce:true});
+ }catch(e){setStatus("Could not load the device setup page. Make sure you are on the same Wi-Fi network.","bad");}
+}
+async function refreshFromDevice(){
+ if(busy||userEditing)return;
+ try{
+  const [cfg,stat]=await Promise.all([fetch("/api/config",{cache:"no-store"}),fetch("/api/status",{cache:"no-store"})]);
+  applyRemoteState(await cfg.json(),await stat.json());
+ }catch(e){}
+}
+async function testProtocol(){
+ const hvac=currentHvac();if(!hvac)return;
+ busy=true;setStatus(`Sending a ${protocolLabels[selectedProtocol]||selectedProtocol} test command...`);
+ els.testBtn.disabled=true;
+ try{
+  const res=await fetch("/api/protocol/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:hvac.id,protocol:selectedProtocol})});
+  const json=await res.json();if(!res.ok||!json.ok)throw new Error(json.error||"send_failed");
+  setStatus(`Test sent with ${protocolLabels[selectedProtocol]||selectedProtocol}. If the AC reacted, save it.`,"good");
+ }catch(e){setStatus(`Test failed: ${e.message}`,"bad");}
+ finally{busy=false;render();}
+}
+async function saveProtocol(){
+ const hvac=currentHvac();if(!hvac)return;
+ busy=true;hvac.protocol=selectedProtocol;setStatus("Saving protocol to the device...");
+ els.saveBtn.disabled=true;
+ try{
+  const res=await fetch("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(config)});
+  const json=await res.json();if(!res.ok||!json.ok)throw new Error(json.error||"save_failed");
+  await load();setStatus(`${protocolLabels[selectedProtocol]||selectedProtocol} saved. HomeKit commands will now use this protocol.`,"good");
+ }catch(e){setStatus(`Save failed: ${e.message}`,"bad");}
+ finally{busy=false;userEditing=false;render();}
+}
+els.hvacSelect.addEventListener("change",e=>{selectedId=e.target.value;userEditing=false;selectedProtocol=(currentHvac()?.protocol||"daikin").toLowerCase();render();});
+els.protocols.addEventListener("click",e=>{const btn=e.target.closest("[data-protocol]");if(!btn)return;userEditing=true;selectedProtocol=btn.dataset.protocol;render();setStatus(`Ready to test ${protocolLabels[selectedProtocol]||selectedProtocol}.`);});
+els.testBtn.addEventListener("click",testProtocol);els.saveBtn.addEventListener("click",saveProtocol);load();setInterval(refreshFromDevice,2500);
+</script>
+</body>
+</html>)html";
 
 void log_onboarding_codes()
 {
@@ -234,6 +376,19 @@ void log_onboarding_codes()
 
     ESP_LOGI(kTag, "Matter discriminator: %u", payload.discriminator.GetLongValue());
     ESP_LOGI(kTag, "Matter setup passcode: %u", static_cast<unsigned>(payload.setUpPINCode));
+}
+
+void log_embedded_tls_certificate()
+{
+    const size_t cert_len = static_cast<size_t>(kTlsRootCaPemEnd - kTlsRootCaPemStart);
+    ESP_LOGI(kTag, "TLS root CA symbol range: start=%p end=%p", kTlsRootCaPemStart, kTlsRootCaPemEnd);
+    if (cert_len == 0) {
+        ESP_LOGW(kTag, "Embedded TLS root CA certificate is empty");
+        return;
+    }
+
+    ESP_LOGI(kTag, "Embedded TLS root CA certificate ready (%u bytes, first_byte=0x%02x)",
+             static_cast<unsigned>(cert_len), static_cast<unsigned>(kTlsRootCaPemStart[0]));
 }
 
 void copy_string(char *dst, size_t dst_size, const char *src)
@@ -335,36 +490,6 @@ void report_all_local_temperatures()
 {
     for (uint8_t i = 0; i < g_config.hvac_count; ++i) {
         report_local_temperature(i);
-    }
-}
-
-void apply_thermostat_limits(uint16_t endpoint_id)
-{
-    auto update_limit = [endpoint_id](uint32_t attribute_id, int16_t value) {
-        esp_matter_attr_val_t attr = esp_matter_int16(value);
-        esp_err_t err = esp_matter::attribute::update(endpoint_id, chip::app::Clusters::Thermostat::Id, attribute_id, &attr);
-        if (err != ESP_OK) {
-            ESP_LOGW(kTag, "Failed to update thermostat limit attr=0x%08lx on endpoint %u: %s",
-                     static_cast<unsigned long>(attribute_id), endpoint_id, esp_err_to_name(err));
-        }
-    };
-
-    update_limit(chip::app::Clusters::Thermostat::Attributes::AbsMinHeatSetpointLimit::Id, kMinSetpointCentiC);
-    update_limit(chip::app::Clusters::Thermostat::Attributes::AbsMaxHeatSetpointLimit::Id, kMaxSetpointCentiC);
-    update_limit(chip::app::Clusters::Thermostat::Attributes::AbsMinCoolSetpointLimit::Id, kMinSetpointCentiC);
-    update_limit(chip::app::Clusters::Thermostat::Attributes::AbsMaxCoolSetpointLimit::Id, kMaxSetpointCentiC);
-    update_limit(chip::app::Clusters::Thermostat::Attributes::MinHeatSetpointLimit::Id, kMinSetpointCentiC);
-    update_limit(chip::app::Clusters::Thermostat::Attributes::MaxHeatSetpointLimit::Id, kMaxSetpointCentiC);
-    update_limit(chip::app::Clusters::Thermostat::Attributes::MinCoolSetpointLimit::Id, kMinSetpointCentiC);
-    update_limit(chip::app::Clusters::Thermostat::Attributes::MaxCoolSetpointLimit::Id, kMaxSetpointCentiC);
-}
-
-void apply_all_thermostat_limits()
-{
-    for (uint8_t i = 0; i < g_config.hvac_count; ++i) {
-        if (g_endpoint_ids[i] != 0) {
-            apply_thermostat_limits(g_endpoint_ids[i]);
-        }
     }
 }
 
@@ -735,17 +860,44 @@ void sync_linked_matter_state(uint16_t endpoint_id, const HvacState &state, bool
     }
 }
 
-esp_err_t dispatch_hvac_ir(uint8_t index, const char *reason)
+void sync_protocol_mode_to_matter(uint8_t index)
+{
+    if (index >= g_config.hvac_count) {
+        return;
+    }
+
+    const uint16_t endpoint_id = g_endpoint_ids[index];
+    if (endpoint_id == 0) {
+        return;
+    }
+
+    esp_matter_attr_val_t protocol_mode = esp_matter_uint8(protocol_to_mode(g_config.hvacs[index].protocol));
+    const esp_err_t err = esp_matter::attribute::update(endpoint_id, chip::app::Clusters::ModeSelect::Id,
+                                                        chip::app::Clusters::ModeSelect::Attributes::CurrentMode::Id,
+                                                        &protocol_mode);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "Failed to sync protocol mode for %s endpoint=%u to Matter: %s", g_config.hvacs[index].id, endpoint_id,
+                 esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGI(kTag, "Synced protocol mode for %s endpoint=%u to %s", g_config.hvacs[index].id, endpoint_id,
+             g_config.hvacs[index].protocol);
+}
+
+esp_err_t dispatch_hvac_ir_with_options(uint8_t index, const char *reason, const char *protocol_override,
+                                        bool force_power_on)
 {
     if (index >= g_config.hvac_count) {
         return ESP_ERR_INVALID_ARG;
     }
 
+    const char *protocol = protocol_override && protocol_override[0] != '\0' ? protocol_override : g_config.hvacs[index].protocol;
     hvac_ir_command_t command = {
-        .protocol = g_config.hvacs[index].protocol,
+        .protocol = protocol,
         .model = g_config.hvacs[index].model,
         .emitter_gpio = g_config.hvacs[index].emitter_gpio,
-        .power = g_states[index].power,
+        .power = force_power_on ? true : g_states[index].power,
         .system_mode = g_states[index].system_mode,
         .fan_mode = g_states[index].fan_mode,
         .target_temperature_centi_c = active_target_setpoint(g_states[index]),
@@ -755,17 +907,29 @@ esp_err_t dispatch_hvac_ir(uint8_t index, const char *reason)
     g_states[index].last_send_err = err;
     ESP_LOGI(kTag,
              "send reason=%s hvac=%s endpoint=%u protocol=%s emitter_gpio=%d power=%d mode=%u cool=%.2f heat=%.2f fan=%u err=%s",
-             reason ? reason : "unknown", g_config.hvacs[index].id, g_endpoint_ids[index], g_config.hvacs[index].protocol,
-             g_config.hvacs[index].emitter_gpio, g_states[index].power, g_states[index].system_mode,
+             reason ? reason : "unknown", g_config.hvacs[index].id, g_endpoint_ids[index], protocol,
+             g_config.hvacs[index].emitter_gpio, command.power, g_states[index].system_mode,
              g_states[index].cooling_setpoint / 100.0, g_states[index].heating_setpoint / 100.0, g_states[index].fan_mode,
              esp_err_to_name(err));
     return err;
+}
+
+esp_err_t dispatch_hvac_ir(uint8_t index, const char *reason)
+{
+    return dispatch_hvac_ir_with_options(index, reason, nullptr, false);
 }
 
 esp_err_t send_json_response(httpd_req_t *req, const char *json)
 {
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, json ? json : "{}");
+}
+
+esp_err_t setup_page_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, kSetupPageHtml, HTTPD_RESP_USE_STRLEN);
 }
 
 esp_err_t config_get_handler(httpd_req_t *req)
@@ -852,6 +1016,7 @@ esp_err_t config_post_handler(httpd_req_t *req)
         return httpd_resp_sendstr(req, "{\"error\":\"invalid_json\"}");
     }
 
+    const AppConfig previous = g_config;
     g_config = next;
     esp_err_t err = save_config();
     free(body);
@@ -860,7 +1025,14 @@ esp_err_t config_post_handler(httpd_req_t *req)
         return httpd_resp_sendstr(req, "{\"error\":\"save_failed\"}");
     }
 
-    return httpd_resp_sendstr(req, "{\"ok\":true,\"restart_required\":true}");
+    const uint8_t sync_count = previous.hvac_count < g_config.hvac_count ? previous.hvac_count : g_config.hvac_count;
+    for (uint8_t i = 0; i < sync_count; ++i) {
+        if (strcmp(previous.hvacs[i].protocol, g_config.hvacs[i].protocol) != 0) {
+            sync_protocol_mode_to_matter(i);
+        }
+    }
+
+    return httpd_resp_sendstr(req, "{\"ok\":true,\"restart_required\":false}");
 }
 
 esp_err_t hvac_send_post_handler(httpd_req_t *req)
@@ -960,15 +1132,189 @@ esp_err_t hvac_send_post_handler(httpd_req_t *req)
     return send_err;
 }
 
+esp_err_t protocol_test_post_handler(httpd_req_t *req)
+{
+    if (req->content_len <= 0 || req->content_len > static_cast<int>(kMaxBodyBytes)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"invalid_body\"}");
+    }
+
+    char *body = static_cast<char *>(calloc(1, req->content_len + 1));
+    if (!body) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"error\":\"oom\"}");
+    }
+
+    int offset = 0;
+    while (offset < req->content_len) {
+        const int read = httpd_req_recv(req, body + offset, req->content_len - offset);
+        if (read <= 0) {
+            free(body);
+            httpd_resp_set_status(req, "400 Bad Request");
+            return httpd_resp_sendstr(req, "{\"error\":\"recv_failed\"}");
+        }
+        offset += read;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"invalid_json\"}");
+    }
+
+    const int index = hvac_index_from_id(read_json_string(root, "id"));
+    char protocol[24] = {};
+    lowercase_copy(protocol, sizeof(protocol), read_json_string(root, "protocol"));
+
+    if (index < 0) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "404 Not Found");
+        return httpd_resp_sendstr(req, "{\"error\":\"unknown_hvac\"}");
+    }
+    if (!ir_sender_is_protocol_supported(protocol)) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"error\":\"unsupported_protocol\"}");
+    }
+
+    const esp_err_t err = dispatch_hvac_ir_with_options(static_cast<uint8_t>(index), "protocol-test", protocol, true);
+    cJSON_Delete(root);
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(resp, "id", g_config.hvacs[index].id);
+    cJSON_AddStringToObject(resp, "protocol", protocol);
+    cJSON_AddStringToObject(resp, "error", esp_err_to_name(err));
+    char *json = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    esp_err_t send_err = send_json_response(req, json);
+    if (json) {
+        cJSON_free(json);
+    }
+    return send_err;
+}
+
+const char *wifi_disconnect_reason_name(uint8_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE:
+        return "AUTH_EXPIRE";
+    case WIFI_REASON_AUTH_LEAVE:
+        return "AUTH_LEAVE";
+    case WIFI_REASON_ASSOC_EXPIRE:
+        return "ASSOC_EXPIRE";
+    case WIFI_REASON_ASSOC_TOOMANY:
+        return "ASSOC_TOOMANY";
+    case WIFI_REASON_NOT_AUTHED:
+        return "NOT_AUTHED";
+    case WIFI_REASON_NOT_ASSOCED:
+        return "NOT_ASSOCED";
+    case WIFI_REASON_ASSOC_LEAVE:
+        return "ASSOC_LEAVE";
+    case WIFI_REASON_ASSOC_NOT_AUTHED:
+        return "ASSOC_NOT_AUTHED";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        return "4WAY_HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT:
+        return "GROUP_KEY_UPDATE_TIMEOUT";
+    case WIFI_REASON_IE_IN_4WAY_DIFFERS:
+        return "IE_IN_4WAY_DIFFERS";
+    case WIFI_REASON_AUTH_FAIL:
+        return "AUTH_FAIL";
+    case WIFI_REASON_ASSOC_FAIL:
+        return "ASSOC_FAIL";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return "HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_NO_AP_FOUND:
+        return "NO_AP_FOUND";
+    case WIFI_REASON_BEACON_TIMEOUT:
+        return "BEACON_TIMEOUT";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+void log_forwarded_esp_system_event(const ChipDeviceEvent *event)
+{
+    if (!event) {
+        return;
+    }
+
+    const auto &esp_event = event->Platform.ESPSystemEvent;
+
+    if (esp_event.Base == WIFI_EVENT) {
+        switch (esp_event.Id) {
+        case WIFI_EVENT_STA_START:
+            set_wifi_hostname();
+            ESP_LOGI(kTag, "WiFi diag: station started");
+            break;
+        case WIFI_EVENT_STA_CONNECTED: {
+            const auto &wifi_event = esp_event.Data.WiFiStaConnected;
+            ESP_LOGI(kTag, "WiFi diag: connected ssid=%.*s channel=%u authmode=%u",
+                     wifi_event.ssid_len, reinterpret_cast<const char *>(wifi_event.ssid), wifi_event.channel,
+                     static_cast<unsigned>(wifi_event.authmode));
+            break;
+        }
+        case WIFI_EVENT_STA_DISCONNECTED: {
+            const auto &wifi_event = esp_event.Data.WiFiStaDisconnected;
+            const uint8_t reason = wifi_event.reason;
+            ESP_LOGW(kTag, "WiFi diag: disconnected ssid=%.*s reason=%u (%s) rssi=%d",
+                     wifi_event.ssid_len, reinterpret_cast<const char *>(wifi_event.ssid), static_cast<unsigned>(reason),
+                     wifi_disconnect_reason_name(reason), wifi_event.rssi);
+            break;
+        }
+        default:
+            ESP_LOGI(kTag, "WiFi diag: WIFI_EVENT id=%ld", static_cast<long>(esp_event.Id));
+            break;
+        }
+        return;
+    }
+
+    if (esp_event.Base == IP_EVENT) {
+        switch (esp_event.Id) {
+        case IP_EVENT_STA_GOT_IP: {
+            const auto &ip_event = esp_event.Data.IpGotIp;
+            ESP_LOGI(kTag, "WiFi diag: got IPv4 " IPSTR " gw=" IPSTR, IP2STR(&ip_event.ip_info.ip),
+                     IP2STR(&ip_event.ip_info.gw));
+            advertise_http_setup_service(ip_event.ip_info.ip);
+            break;
+        }
+        case IP_EVENT_STA_LOST_IP:
+            ESP_LOGW(kTag, "WiFi diag: lost IPv4 address");
+            break;
+        default:
+            ESP_LOGI(kTag, "WiFi diag: IP_EVENT id=%ld", static_cast<long>(esp_event.Id));
+            break;
+        }
+    }
+}
+
 void start_http_server()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 10;
+    config.max_uri_handlers = 12;
 
     if (httpd_start(&g_httpd, &config) != ESP_OK) {
         ESP_LOGW(kTag, "HTTP server start failed");
         return;
     }
+
+    httpd_uri_t setup_page = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = setup_page_get_handler,
+        .user_ctx = nullptr,
+    };
+    httpd_register_uri_handler(g_httpd, &setup_page);
+
+    httpd_uri_t setup_alias = {
+        .uri = "/setup",
+        .method = HTTP_GET,
+        .handler = setup_page_get_handler,
+        .user_ctx = nullptr,
+    };
+    httpd_register_uri_handler(g_httpd, &setup_alias);
 
     httpd_uri_t config_get = {
         .uri = "/api/config",
@@ -1001,6 +1347,137 @@ void start_http_server()
         .user_ctx = nullptr,
     };
     httpd_register_uri_handler(g_httpd, &hvac_send_post);
+
+    httpd_uri_t protocol_test_post = {
+        .uri = "/api/protocol/test",
+        .method = HTTP_POST,
+        .handler = protocol_test_post_handler,
+        .user_ctx = nullptr,
+    };
+    httpd_register_uri_handler(g_httpd, &protocol_test_post);
+}
+
+void set_wifi_hostname()
+{
+    if (g_wifi_hostname_set) {
+        return;
+    }
+
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        ESP_LOGW(kTag, "WiFi station netif unavailable; hostname %s not set yet", kWifiHostname);
+        return;
+    }
+
+    const esp_err_t err = esp_netif_set_hostname(sta_netif, kWifiHostname);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "Failed to set WiFi hostname %s: %s", kWifiHostname, esp_err_to_name(err));
+        return;
+    }
+
+    g_wifi_hostname_set = true;
+    ESP_LOGI(kTag, "WiFi hostname set to %s; try http://%s or router-provided local DNS", kWifiHostname,
+             kWifiHostname);
+}
+
+void prepare_wifi_hostname()
+{
+    esp_err_t err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(kTag, "Failed to create default event loop before hostname setup: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(kTag, "Failed to initialize esp-netif before hostname setup: %s", esp_err_to_name(err));
+        return;
+    }
+
+    if (!esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") && !esp_netif_create_default_wifi_sta()) {
+        ESP_LOGW(kTag, "Failed to create WiFi station netif before hostname setup");
+        return;
+    }
+
+    set_wifi_hostname();
+}
+
+void ensure_mdns_started()
+{
+    if (g_mdns_started) {
+        return;
+    }
+
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(kTag, "Failed to initialize mDNS responder: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = mdns_hostname_set(kWifiHostname);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "Failed to set mDNS hostname %s.local: %s", kWifiHostname, esp_err_to_name(err));
+        return;
+    }
+
+    err = mdns_instance_name_set(kHttpMdnsInstanceName);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "Failed to set mDNS instance name %s: %s", kHttpMdnsInstanceName, esp_err_to_name(err));
+        return;
+    }
+
+    g_mdns_started = true;
+    ESP_LOGI(kTag, "mDNS responder ready for %s.local", kWifiHostname);
+}
+
+void advertise_http_setup_service(const esp_ip4_addr_t &ip)
+{
+    ensure_mdns_started();
+    if (!g_mdns_started) {
+        return;
+    }
+
+    if (!g_http_mdns_service_started) {
+        esp_err_t err = ESP_OK;
+        mdns_txt_item_t service_txt[] = {
+            {"path", "/"},
+            {"app", "ir-hvac"},
+        };
+
+        err = mdns_service_add(kHttpMdnsInstanceName, "_http", "_tcp", 80, service_txt,
+                               sizeof(service_txt) / sizeof(service_txt[0]));
+        if (err != ESP_OK) {
+            ESP_LOGW(kTag, "Failed to advertise HTTP setup service over mDNS: %s", esp_err_to_name(err));
+            return;
+        }
+        g_http_mdns_service_started = true;
+    }
+
+    ESP_LOGI(kTag, "HTTP setup mDNS ready at http://%s.local/ (" IPSTR ", %s._http._tcp.local)", kWifiHostname,
+             IP2STR(&ip), kHttpMdnsInstanceName);
+}
+
+void advertise_http_setup_service_if_ready()
+{
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!sta_netif) {
+        ESP_LOGW(kTag, "WiFi station netif unavailable; skipping immediate mDNS advertisement");
+        return;
+    }
+
+    esp_netif_ip_info_t ip_info = {};
+    const esp_err_t err = esp_netif_get_ip_info(sta_netif, &ip_info);
+    if (err != ESP_OK) {
+        ESP_LOGW(kTag, "Failed to read WiFi station IP for mDNS advertisement: %s", esp_err_to_name(err));
+        return;
+    }
+
+    if (ip_info.ip.addr == 0) {
+        ESP_LOGI(kTag, "WiFi station has no IPv4 address yet; waiting for IP event before advertising mDNS");
+        return;
+    }
+
+    advertise_http_setup_service(ip_info.ip);
 }
 
 static void app_event_cb(const ChipDeviceEvent *event, intptr_t)
@@ -1025,6 +1502,9 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t)
                                                  chip::CommissioningWindowAdvertisement::kDnssdOnly);
             }
         }
+        break;
+    case chip::DeviceLayer::DeviceEventType::kESPSystemEvent:
+        log_forwarded_esp_system_event(event);
         break;
     default:
         break;
@@ -1081,6 +1561,7 @@ static esp_err_t app_attribute_update_cb(esp_matter::attribute::callback_type_t 
         ESP_RETURN_ON_ERROR(save_config(), kTag, "Failed to persist protocol selection for %s", g_config.hvacs[index].id);
         ESP_LOGI(kTag, "Protocol mode changed for %s endpoint=%u mode=%u protocol=%s", g_config.hvacs[index].id, endpoint_id,
                  val->val.u8, g_config.hvacs[index].protocol);
+        return ESP_OK;
     } else {
         return ESP_OK;
     }
@@ -1093,7 +1574,12 @@ static esp_err_t app_attribute_update_cb(esp_matter::attribute::callback_type_t 
                              cluster_id == chip::app::Clusters::OnOff::Id &&
                                  attribute_id == chip::app::Clusters::OnOff::Attributes::OnOff::Id);
     report_local_temperature(static_cast<uint8_t>(index));
-    return dispatch_hvac_ir(static_cast<uint8_t>(index), "matter");
+    const esp_err_t ir_err = dispatch_hvac_ir(static_cast<uint8_t>(index), "matter");
+    if (ir_err != ESP_OK) {
+        ESP_LOGW(kTag, "Matter state accepted, but IR dispatch failed for endpoint %u: %s", endpoint_id,
+                 esp_err_to_name(ir_err));
+    }
+    return ESP_OK;
 }
 
 void temperature_sensor_task(void *)
@@ -1248,6 +1734,8 @@ extern "C" void app_main()
     }
     ESP_ERROR_CHECK(err);
 
+    log_embedded_tls_certificate();
+
     load_default_states();
     load_config();
     refresh_all_local_temperatures();
@@ -1258,16 +1746,20 @@ extern "C" void app_main()
 
     create_hvac_endpoints(node);
 
+    prepare_wifi_hostname();
+
+    ESP_LOGI(kTag, "Starting Matter stack");
     err = esp_matter::start(app_event_cb);
     ESP_ERROR_CHECK(err);
+    ESP_LOGI(kTag, "Matter stack started");
 
-    apply_all_thermostat_limits();
     apply_hvac_user_labels();
     init_temperature_sensor();
 
     log_onboarding_codes();
 
     start_http_server();
-    ESP_LOGI(kTag, "HTTP backend ready at /api/config, /api/status, and /api/hvac/send");
+    advertise_http_setup_service_if_ready();
+    ESP_LOGI(kTag, "HTTP setup UI ready at / with APIs /api/config, /api/status, /api/hvac/send, and /api/protocol/test");
     ESP_LOGI(kTag, "GPIO selection: ir_emitter=%d temp_sensor=%d", g_config.hvacs[0].emitter_gpio, kDefaultTempSensorGpio);
 }
